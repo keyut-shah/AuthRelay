@@ -1,7 +1,11 @@
 import { NativeModules } from 'react-native';
 import { createMMKV, type MMKV } from 'react-native-mmkv';
 import { EVENT_HISTORY_CAP, StorageKeys } from './keys';
-import type { ProcessedMessageEvent, ReceiverForm, StoredRoute } from '../types';
+import type {
+  DestinationConfig,
+  ProcessedMessageEvent,
+  RouteRule,
+} from '../types';
 
 export const STORAGE_ID = 'msg-forwarder-storage';
 
@@ -24,6 +28,7 @@ export function initStorage(): Promise<void> {
     }
     const encryptionKey = await native.getEncryptionKey();
     storage = createMMKV({ id: STORAGE_ID, encryptionKey });
+    runMigrations(storage);
   })();
 
   return initPromise;
@@ -36,60 +41,200 @@ function requireStorage(): MMKV {
   return storage;
 }
 
-const createRouteId = () =>
-  `route_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+const newId = (prefix: string) =>
+  `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
-const normalizeRoute = (route: ReceiverForm | StoredRoute): StoredRoute => ({
-  ...route,
-  id: 'id' in route && route.id ? route.id : createRouteId(),
-});
+// ───────────────────────────────────────────────────────────
+// Migration: legacy `app_routes` → split into destinations + rules
+// ───────────────────────────────────────────────────────────
+
+type LegacyStoredRoute = {
+  id?: string;
+  teamName?: string;
+  telegramName?: string;
+  telegramBotToken?: string;
+  telegramChatId?: string;
+  senderFilter?: string;
+};
+
+function runMigrations(mmkv: MMKV) {
+  const legacyRaw = mmkv.getString(StorageKeys.ROUTES_LEGACY);
+  if (!legacyRaw) return;
+
+  const hasNewDestinations = !!mmkv.getString(StorageKeys.DESTINATIONS);
+  const hasNewRules = !!mmkv.getString(StorageKeys.RULES);
+
+  // If new keys are already populated, just drop the legacy blob.
+  if (hasNewDestinations || hasNewRules) {
+    mmkv.remove(StorageKeys.ROUTES_LEGACY);
+    return;
+  }
+
+  try {
+    const parsed = JSON.parse(legacyRaw) as LegacyStoredRoute[];
+    const destinations: DestinationConfig[] = [];
+    const rules: RouteRule[] = [];
+
+    for (const legacy of parsed) {
+      if (
+        !legacy ||
+        !legacy.telegramBotToken ||
+        !legacy.telegramChatId ||
+        !legacy.senderFilter
+      ) {
+        continue;
+      }
+      const destinationId = newId('dest');
+      destinations.push({
+        id: destinationId,
+        name: legacy.telegramName || 'Telegram',
+        provider: {
+          type: 'telegram',
+          botToken: legacy.telegramBotToken,
+          chatId: legacy.telegramChatId,
+        },
+      });
+      rules.push({
+        id: legacy.id || newId('rule'),
+        enabled: true,
+        teamName: legacy.teamName || 'Ops',
+        senderPattern: legacy.senderFilter.trim(),
+        senderMatchMode: 'contains',
+        destinationId,
+      });
+    }
+
+    mmkv.set(StorageKeys.DESTINATIONS, JSON.stringify(destinations));
+    mmkv.set(StorageKeys.RULES, JSON.stringify(rules));
+    mmkv.remove(StorageKeys.ROUTES_LEGACY);
+    console.info(`[storage] Migrated ${rules.length} legacy route(s) to destinations + rules.`);
+  } catch (e) {
+    console.error('[storage] Failed to migrate legacy routes', e);
+  }
+}
+
+// ───────────────────────────────────────────────────────────
+// Validation
+// ───────────────────────────────────────────────────────────
+
+function isDestinationConfig(value: unknown): value is DestinationConfig {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  if (typeof v.id !== 'string' || typeof v.name !== 'string') return false;
+  const provider = v.provider as Record<string, unknown> | undefined;
+  if (!provider) return false;
+  if (provider.type === 'telegram') {
+    return typeof provider.botToken === 'string' && typeof provider.chatId === 'string';
+  }
+  return false;
+}
+
+function isRouteRule(value: unknown): value is RouteRule {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.id === 'string' &&
+    typeof v.enabled === 'boolean' &&
+    typeof v.teamName === 'string' &&
+    typeof v.senderPattern === 'string' &&
+    v.senderMatchMode === 'contains' &&
+    typeof v.destinationId === 'string'
+  );
+}
+
+function isProcessedMessageEvent(value: unknown): value is ProcessedMessageEvent {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.id === 'string' &&
+    typeof v.createdAt === 'number' &&
+    typeof v.sender === 'string' &&
+    (v.status === 'sent' || v.status === 'failed' || v.status === 'ignored') &&
+    (v.maskedCode === null || typeof v.maskedCode === 'string')
+  );
+}
+
+// ───────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────
+
+function readJsonArray<T>(key: string, guard: (value: unknown) => value is T): T[] {
+  const raw = requireStorage().getString(key);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(guard);
+  } catch (e) {
+    console.error(`Failed to parse ${key} from MMKV`, e);
+    return [];
+  }
+}
 
 export const StorageHelpers = {
-  saveRoutes: (routes: StoredRoute[]) => {
-    requireStorage().set(StorageKeys.ROUTES, JSON.stringify(routes));
+  // — Destinations —
+  getDestinations: (): DestinationConfig[] =>
+    readJsonArray(StorageKeys.DESTINATIONS, isDestinationConfig),
+
+  saveDestinations: (destinations: DestinationConfig[]) => {
+    requireStorage().set(StorageKeys.DESTINATIONS, JSON.stringify(destinations));
   },
-  getRoutes: (): StoredRoute[] => {
-    const data = requireStorage().getString(StorageKeys.ROUTES);
-    if (!data) {
-      return [];
+
+  upsertDestination: (destination: DestinationConfig) => {
+    const existing = StorageHelpers.getDestinations();
+    const idx = existing.findIndex(d => d.id === destination.id);
+    if (idx >= 0) {
+      existing[idx] = destination;
+    } else {
+      existing.push(destination);
     }
+    StorageHelpers.saveDestinations(existing);
+    return existing;
+  },
 
-    try {
-      const parsed = JSON.parse(data) as Array<ReceiverForm | StoredRoute>;
-      const routes = parsed.map(normalizeRoute);
-      const needsMigration = parsed.some(
-        route => !('id' in route) || typeof route.id !== 'string' || route.id.length === 0,
-      );
+  /**
+   * Remove a destination and every rule that points to it. Returns the new state.
+   */
+  removeDestination: (destinationId: string) => {
+    const destinations = StorageHelpers.getDestinations().filter(d => d.id !== destinationId);
+    const rules = StorageHelpers.getRules().filter(r => r.destinationId !== destinationId);
+    StorageHelpers.saveDestinations(destinations);
+    StorageHelpers.saveRules(rules);
+    return { destinations, rules };
+  },
 
-      // Persist migrated route ids so the list has stable keys on future launches.
-      if (needsMigration) {
-        StorageHelpers.saveRoutes(routes);
-      }
+  newDestinationId: () => newId('dest'),
 
-      return routes;
-    } catch (e) {
-      console.error('Failed to parse routes from MMKV', e);
-      return [];
+  // — Rules —
+  getRules: (): RouteRule[] => readJsonArray(StorageKeys.RULES, isRouteRule),
+
+  saveRules: (rules: RouteRule[]) => {
+    requireStorage().set(StorageKeys.RULES, JSON.stringify(rules));
+  },
+
+  upsertRule: (rule: RouteRule) => {
+    const existing = StorageHelpers.getRules();
+    const idx = existing.findIndex(r => r.id === rule.id);
+    if (idx >= 0) {
+      existing[idx] = rule;
+    } else {
+      existing.push(rule);
     }
-  },
-  removeRoute: (routeId: string) => {
-    const routes = StorageHelpers.getRoutes().filter(route => route.id !== routeId);
-    StorageHelpers.saveRoutes(routes);
-    return routes;
+    StorageHelpers.saveRules(existing);
+    return existing;
   },
 
-  getEvents: (): ProcessedMessageEvent[] => {
-    const data = requireStorage().getString(StorageKeys.EVENTS);
-    if (!data) return [];
-    try {
-      const parsed = JSON.parse(data) as unknown;
-      if (!Array.isArray(parsed)) return [];
-      return parsed.filter(isProcessedMessageEvent);
-    } catch (e) {
-      console.error('Failed to parse events from MMKV', e);
-      return [];
-    }
+  removeRule: (ruleId: string) => {
+    const rules = StorageHelpers.getRules().filter(r => r.id !== ruleId);
+    StorageHelpers.saveRules(rules);
+    return rules;
   },
+
+  newRuleId: () => newId('rule'),
+
+  // — Events (history) —
+  getEvents: (): ProcessedMessageEvent[] =>
+    readJsonArray(StorageKeys.EVENTS, isProcessedMessageEvent),
 
   appendEvent: (event: ProcessedMessageEvent) => {
     const events = StorageHelpers.getEvents();
@@ -105,15 +250,3 @@ export const StorageHelpers = {
     requireStorage().set(StorageKeys.EVENTS, JSON.stringify([]));
   },
 };
-
-function isProcessedMessageEvent(value: unknown): value is ProcessedMessageEvent {
-  if (!value || typeof value !== 'object') return false;
-  const v = value as Record<string, unknown>;
-  return (
-    typeof v.id === 'string' &&
-    typeof v.createdAt === 'number' &&
-    typeof v.sender === 'string' &&
-    (v.status === 'sent' || v.status === 'failed' || v.status === 'ignored') &&
-    (v.maskedCode === null || typeof v.maskedCode === 'string')
-  );
-}

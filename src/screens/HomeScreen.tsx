@@ -20,11 +20,17 @@ import {
   simulateIncomingSms,
   subscribeToIncomingSms,
 } from '../native/smsRouter';
+import { testDestination } from '../services/integrations';
 import { extractOtp, maskMessagePreview } from '../services/otp';
-import { sendTelegramMessage } from '../services/telegram';
 import { StorageHelpers } from '../storage';
 import { palette } from '../theme';
-import type { ReceiverForm, SmsEventPreview, StoredRoute } from '../types';
+import type {
+  DestinationConfig,
+  ReceiverForm,
+  RouteRule,
+  RouteRuleView,
+  SmsEventPreview,
+} from '../types';
 
 import { useNavigation } from '@react-navigation/native';
 
@@ -38,8 +44,21 @@ const initialForm: ReceiverForm = {
   senderFilter: '',
 };
 
+function buildRuleViews(
+  rules: RouteRule[],
+  destinations: DestinationConfig[],
+): RouteRuleView[] {
+  const byId = new Map(destinations.map(d => [d.id, d] as const));
+  return rules.map(rule => ({ rule, destination: byId.get(rule.destinationId) ?? null }));
+}
+
 export function HomeScreen() {
-  const [routes, setRoutes] = useState<StoredRoute[]>(StorageHelpers.getRoutes());
+  const [rules, setRules] = useState<RouteRule[]>(StorageHelpers.getRules());
+  const [destinations, setDestinations] = useState<DestinationConfig[]>(
+    StorageHelpers.getDestinations(),
+  );
+  const ruleViews = buildRuleViews(rules, destinations);
+
   const [showWizard, setShowWizard] = useState(false);
   const [currentStep, setCurrentStep] = useState(0);
 
@@ -54,7 +73,7 @@ export function HomeScreen() {
   // Listener & Events
   const [listenerHealth, setListenerHealth] = useState('Checking listener status...');
   const [latestEvent, setLatestEvent] = useState<SmsEventPreview | null>(null);
-  const [activeRouteId, setActiveRouteId] = useState<string | null>(null);
+  const [activeRuleId, setActiveRuleId] = useState<string | null>(null);
   const [telegramStatus, setTelegramStatus] = useState<string | null>(null);
 
   const navigation = useNavigation();
@@ -146,16 +165,31 @@ export function HomeScreen() {
     if (!canFinishSetup) return;
     const trimmedFilter = receiverForm.senderFilter.trim();
     if (trimmedFilter.length === 0) return;
-    const updatedRoutes = [
-      ...routes,
-      {
-        ...receiverForm,
-        senderFilter: trimmedFilter,
-        id: `route_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+
+    // Create a fresh destination + rule pair. Reusing an existing destination
+    // across rules is a follow-up feature (the data model supports it).
+    const destination: DestinationConfig = {
+      id: StorageHelpers.newDestinationId(),
+      name: receiverForm.telegramName.trim(),
+      provider: {
+        type: 'telegram',
+        botToken: receiverForm.telegramBotToken.trim(),
+        chatId: receiverForm.telegramChatId.trim(),
       },
-    ];
-    setRoutes(updatedRoutes);
-    StorageHelpers.saveRoutes(updatedRoutes);
+    };
+    const rule: RouteRule = {
+      id: StorageHelpers.newRuleId(),
+      enabled: true,
+      teamName: receiverForm.teamName.trim(),
+      senderPattern: trimmedFilter,
+      senderMatchMode: 'contains',
+      destinationId: destination.id,
+    };
+
+    const updatedDestinations = StorageHelpers.upsertDestination(destination);
+    const updatedRules = StorageHelpers.upsertRule(rule);
+    setDestinations(updatedDestinations);
+    setRules(updatedRules);
     setReceiverForm(initialForm);
     setShowWizard(false);
   };
@@ -184,45 +218,41 @@ export function HomeScreen() {
     }
   };
 
-  const handleSimulation = async (route: StoredRoute) => {
-    const sender = route.senderFilter || 'TEST-SENDER';
-    const team = route.teamName || 'Ops';
-    setActiveRouteId(route.id);
-    setTelegramStatus(`Sending Telegram test for ${route.teamName}...`);
+  const handleTestRule = async ({ rule, destination }: RouteRuleView) => {
+    if (!destination) {
+      Alert.alert('Destination Missing', 'This rule has no destination configured.');
+      return;
+    }
+    const sender = rule.senderPattern || 'TEST-SENDER';
+    const team = rule.teamName || 'Ops';
+    setActiveRuleId(rule.id);
+    setTelegramStatus(`Sending Telegram test for ${team}...`);
 
     try {
-      await sendTelegramMessage(
-        route.telegramBotToken,
-        route.telegramChatId,
-        [
-          `AuthRelay test route for ${team}`,
-          '',
-          `Sender filter: ${sender}`,
-          `Destination: ${route.telegramName}`,
-          '',
-          'If you received this, your Telegram bot token and chat ID are working.',
-        ].join('\n'),
-      );
-      setTelegramStatus(`Telegram test sent successfully for ${route.teamName}.`);
+      await testDestination(destination);
+      setTelegramStatus(`Telegram test sent successfully for ${team}.`);
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : 'Unable to send test message to Telegram.';
+        error instanceof Error ? error.message : 'Unable to send test message.';
       Alert.alert('Telegram Test Failed', message);
-      setTelegramStatus(`Telegram test failed for ${route.teamName}: ${message}`);
+      setTelegramStatus(`Telegram test failed for ${team}: ${message}`);
       return;
     } finally {
-      setActiveRouteId(null);
+      setActiveRuleId(null);
     }
 
     simulateIncomingSms(
       sender,
-      `Your ${team} code is 123456. Never share this code with anyone.`
+      `Your ${team} code is 123456. Never share this code with anyone.`,
     );
   };
 
-  const handleDeleteRoute = (routeId: string) => {
-    const updatedRoutes = StorageHelpers.removeRoute(routeId);
-    setRoutes(updatedRoutes);
+  const handleDeleteRule = (ruleId: string) => {
+    const updatedRules = StorageHelpers.removeRule(ruleId);
+    setRules(updatedRules);
+    // Note: we intentionally don't auto-delete the orphan destination, so the
+    // user can reuse it for a different rule later. A "manage destinations"
+    // screen can clean these up.
   };
 
   const renderWizardStep = () => {
@@ -469,7 +499,7 @@ export function HomeScreen() {
 
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionTitle}>Active Routes</Text>
-          <Text style={styles.routeCount}>{routes.length} configured</Text>
+          <Text style={styles.routeCount}>{rules.length} configured</Text>
         </View>
 
         {telegramStatus ? (
@@ -478,7 +508,7 @@ export function HomeScreen() {
           </View>
         ) : null}
 
-        {routes.length === 0 ? (
+        {rules.length === 0 ? (
           <View style={styles.emptyRoutesContainer}>
             <View style={styles.emptyRouteCircle}>
               <Text style={styles.emptyRouteIcon}>+</Text>
@@ -493,47 +523,60 @@ export function HomeScreen() {
           </View>
         ) : (
           <View style={styles.routesList}>
-            {routes.map(route => (
-              <View key={route.id} style={styles.routeCard}>
-                <View style={styles.routeCardHeader}>
-                  <Text style={styles.routeCardTitle}>{route.teamName}</Text>
-                  <View style={styles.activeBadge}>
-                    <Text style={styles.activeBadgeText}>ACTIVE</Text>
+            {ruleViews.map(view => {
+              const { rule, destination } = view;
+              const destinationLabel = destination
+                ? `Telegram (${destination.name})`
+                : 'Destination missing';
+              return (
+                <View key={rule.id} style={styles.routeCard}>
+                  <View style={styles.routeCardHeader}>
+                    <Text style={styles.routeCardTitle}>{rule.teamName}</Text>
+                    <View
+                      style={[
+                        styles.activeBadge,
+                        !destination && styles.activeBadgeMissing,
+                      ]}
+                    >
+                      <Text style={styles.activeBadgeText}>
+                        {destination ? 'ACTIVE' : 'BROKEN'}
+                      </Text>
+                    </View>
+                  </View>
+
+                  <View style={styles.routeDetails}>
+                    <View style={styles.routeDetailItem}>
+                      <Text style={styles.detailLabel}>Sender</Text>
+                      <Text style={styles.detailValue}>{rule.senderPattern}</Text>
+                    </View>
+                    <View style={styles.routeDetailItem}>
+                      <Text style={styles.detailLabel}>Destination</Text>
+                      <Text style={styles.detailValue}>{destinationLabel}</Text>
+                    </View>
+                  </View>
+
+                  <View style={styles.separator} />
+
+                  <View style={styles.routeActions}>
+                    <Pressable
+                      style={styles.actionButton}
+                      onPress={() => handleTestRule(view)}
+                      disabled={activeRuleId === rule.id || !destination}
+                    >
+                      <Text style={styles.actionButtonText}>
+                        {activeRuleId === rule.id ? 'Sending...' : 'Test Route'}
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.actionButton, styles.deleteActionButton]}
+                      onPress={() => handleDeleteRule(rule.id)}
+                    >
+                      <Text style={styles.actionButtonText}>Delete</Text>
+                    </Pressable>
                   </View>
                 </View>
-
-                <View style={styles.routeDetails}>
-                  <View style={styles.routeDetailItem}>
-                    <Text style={styles.detailLabel}>Sender</Text>
-                    <Text style={styles.detailValue}>{route.senderFilter}</Text>
-                  </View>
-                  <View style={styles.routeDetailItem}>
-                    <Text style={styles.detailLabel}>Destination</Text>
-                    <Text style={styles.detailValue}>Telegram ({route.telegramName})</Text>
-                  </View>
-                </View>
-
-                <View style={styles.separator} />
-
-                <View style={styles.routeActions}>
-                  <Pressable
-                    style={styles.actionButton}
-                    onPress={() => handleSimulation(route)}
-                    disabled={activeRouteId === route.id}
-                  >
-                    <Text style={styles.actionButtonText}>
-                      {activeRouteId === route.id ? 'Sending...' : 'Test Route'}
-                    </Text>
-                  </Pressable>
-                  <Pressable
-                    style={[styles.actionButton, styles.deleteActionButton]}
-                    onPress={() => handleDeleteRoute(route.id)}
-                  >
-                    <Text style={styles.actionButtonText}>Delete</Text>
-                  </Pressable>
-                </View>
-              </View>
-            ))}
+              );
+            })}
 
             <Pressable style={styles.secondaryButton} onPress={startNewRoute}>
               <Text style={styles.secondaryButtonText}>+ Add Another Route</Text>
@@ -735,6 +778,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 6,
+  },
+  activeBadgeMissing: {
+    backgroundColor: palette.dangerLight,
   },
   activeBadgeText: {
     color: palette.success,

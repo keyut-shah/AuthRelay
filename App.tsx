@@ -16,6 +16,9 @@ function TabIcon({ glyph, color }: { glyph: string; color: string }) {
   return <Text style={[styles.tabIcon, { color }]}>{glyph}</Text>;
 }
 
+const renderHomeIcon = ({ color }: { color: string }) => <TabIcon glyph="●" color={color} />;
+const renderHistoryIcon = ({ color }: { color: string }) => <TabIcon glyph="◆" color={color} />;
+
 function App(): React.JSX.Element {
   const [ready, setReady] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
@@ -70,16 +73,12 @@ function App(): React.JSX.Element {
             <Tab.Screen
               name="Home"
               component={HomeScreen}
-              options={{
-                tabBarIcon: ({ color }) => <TabIcon glyph="●" color={color} />,
-              }}
+              options={{ tabBarIcon: renderHomeIcon }}
             />
             <Tab.Screen
               name="History"
               component={HistoryScreen}
-              options={{
-                tabBarIcon: ({ color }) => <TabIcon glyph="◆" color={color} />,
-              }}
+              options={{ tabBarIcon: renderHistoryIcon }}
             />
           </Tab.Navigator>
         </NavigationContainer>

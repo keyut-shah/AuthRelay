@@ -1,5 +1,8 @@
 export const StorageKeys = {
-  ROUTES: 'app_routes',
+  /** @deprecated kept for one-shot migration to DESTINATIONS + RULES */
+  ROUTES_LEGACY: 'app_routes',
+  DESTINATIONS: 'app_destinations',
+  RULES: 'app_rules',
   EVENTS: 'app_events',
 } as const;
 
