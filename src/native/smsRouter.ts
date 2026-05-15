@@ -36,18 +36,19 @@ export async function requestSmsPermission() {
     return false;
   }
 
-  const result = await PermissionsAndroid.request(
+  const results = await PermissionsAndroid.requestMultiple([
     PermissionsAndroid.PERMISSIONS.RECEIVE_SMS,
-    {
-      title: 'Allow SMS access',
-      message:
-        'MsgForwarder needs SMS access to detect incoming OTP messages on this company device.',
-      buttonPositive: 'Allow',
-      buttonNegative: 'Not now',
-    },
-  );
+    PermissionsAndroid.PERMISSIONS.READ_SMS,
+  ]);
 
-  return result === PermissionsAndroid.RESULTS.GRANTED;
+  const receiveGranted =
+    results[PermissionsAndroid.PERMISSIONS.RECEIVE_SMS] ===
+    PermissionsAndroid.RESULTS.GRANTED;
+  const readGranted =
+    results[PermissionsAndroid.PERMISSIONS.READ_SMS] ===
+    PermissionsAndroid.RESULTS.GRANTED;
+
+  return receiveGranted && readGranted;
 }
 
 export async function getListenerStatus(): Promise<ListenerStatus | null> {
