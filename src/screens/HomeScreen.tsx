@@ -20,8 +20,15 @@ import {
   simulateIncomingSms,
   subscribeToIncomingSms,
 } from '../native/smsRouter';
+import type { IncomingSmsEvent } from '../native/smsRouter';
+import {
+  doesRouteMatchSender,
+  forwardSmsToTelegramRoute,
+  sendTelegramMessage,
+} from '../services/telegram';
+import { StorageHelpers } from '../storage';
 import { palette } from '../theme';
-import type { ReceiverForm, SmsEventPreview } from '../types';
+import type { ReceiverForm, SmsEventPreview, StoredRoute } from '../types';
 
 const stepLabels = ['Overview', 'Permissions', 'Telegram', 'Routing'];
 
@@ -34,7 +41,7 @@ const initialForm: ReceiverForm = {
 };
 
 export function HomeScreen() {
-  const [routes, setRoutes] = useState<ReceiverForm[]>([]);
+  const [routes, setRoutes] = useState<StoredRoute[]>(StorageHelpers.getRoutes());
   const [showWizard, setShowWizard] = useState(false);
   const [currentStep, setCurrentStep] = useState(0);
 
@@ -49,6 +56,37 @@ export function HomeScreen() {
   // Listener & Events
   const [listenerHealth, setListenerHealth] = useState('Checking listener status...');
   const [latestEvent, setLatestEvent] = useState<SmsEventPreview | null>(null);
+  const [activeRouteId, setActiveRouteId] = useState<string | null>(null);
+  const [telegramStatus, setTelegramStatus] = useState<string | null>(null);
+
+  const forwardIncomingSms = async (event: IncomingSmsEvent) => {
+    const latestRoutes = StorageHelpers.getRoutes();
+    const matchingRoutes = latestRoutes.filter(route =>
+      doesRouteMatchSender(route, event.sender),
+    );
+
+    if (matchingRoutes.length === 0) {
+      return;
+    }
+
+    const results = await Promise.allSettled(
+      matchingRoutes.map(route => forwardSmsToTelegramRoute(route, event)),
+    );
+
+    const deliveredCount = results.filter(result => result.status === 'fulfilled').length;
+    const failedResult = results.find(result => result.status === 'rejected');
+
+    if (failedResult?.status === 'rejected') {
+      const message =
+        failedResult.reason instanceof Error
+          ? failedResult.reason.message
+          : 'Unable to forward message to Telegram.';
+      setTelegramStatus(`Telegram forward failed: ${message}`);
+      return;
+    }
+
+    setTelegramStatus(`Forwarded to ${deliveredCount} Telegram route${deliveredCount === 1 ? '' : 's'}.`);
+  };
 
   useEffect(() => {
     // 1. Check existing SMS permission state so toggle reflects reality
@@ -92,6 +130,11 @@ export function HomeScreen() {
     // 3. Subscribe to live SMS events
     const subscription = subscribeToIncomingSms(event => {
       setLatestEvent(event);
+      forwardIncomingSms(event).catch(error => {
+        const message =
+          error instanceof Error ? error.message : 'Unable to forward message to Telegram.';
+        setTelegramStatus(`Telegram forward failed: ${message}`);
+      });
     });
 
     return () => {
@@ -119,7 +162,16 @@ export function HomeScreen() {
 
   const finishSetup = () => {
     if (!canFinishSetup) return;
-    setRoutes(prev => [...prev, receiverForm]);
+    const updatedRoutes = [
+      ...routes,
+      {
+        ...receiverForm,
+        id: `route_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+      },
+    ];
+    setRoutes(updatedRoutes);
+    StorageHelpers.saveRoutes(updatedRoutes);
+    setReceiverForm(initialForm);
     setShowWizard(false);
   };
 
@@ -147,13 +199,45 @@ export function HomeScreen() {
     }
   };
 
-  const handleSimulation = (route: ReceiverForm) => {
+  const handleSimulation = async (route: StoredRoute) => {
     const sender = route.senderFilter || 'TEST-SENDER';
     const team = route.teamName || 'Ops';
+    setActiveRouteId(route.id);
+    setTelegramStatus(`Sending Telegram test for ${route.teamName}...`);
+
+    try {
+      await sendTelegramMessage(
+        route.telegramBotToken,
+        route.telegramChatId,
+        [
+          `AuthRelay test route for ${team}`,
+          '',
+          `Sender filter: ${sender}`,
+          `Destination: ${route.telegramName}`,
+          '',
+          'If you received this, your Telegram bot token and chat ID are working.',
+        ].join('\n'),
+      );
+      setTelegramStatus(`Telegram test sent successfully for ${route.teamName}.`);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Unable to send test message to Telegram.';
+      Alert.alert('Telegram Test Failed', message);
+      setTelegramStatus(`Telegram test failed for ${route.teamName}: ${message}`);
+      return;
+    } finally {
+      setActiveRouteId(null);
+    }
+
     simulateIncomingSms(
       sender,
       `Your ${team} code is 123456. Never share this code with anyone.`
     );
+  };
+
+  const handleDeleteRoute = (routeId: string) => {
+    const updatedRoutes = StorageHelpers.removeRoute(routeId);
+    setRoutes(updatedRoutes);
   };
 
   const renderWizardStep = () => {
@@ -397,6 +481,12 @@ export function HomeScreen() {
           <Text style={styles.routeCount}>{routes.length} configured</Text>
         </View>
 
+        {telegramStatus ? (
+          <View style={styles.feedbackBanner}>
+            <Text style={styles.feedbackBannerText}>{telegramStatus}</Text>
+          </View>
+        ) : null}
+
         {routes.length === 0 ? (
           <View style={styles.emptyRoutesContainer}>
             <View style={styles.emptyRouteCircle}>
@@ -412,8 +502,8 @@ export function HomeScreen() {
           </View>
         ) : (
           <View style={styles.routesList}>
-            {routes.map((route, idx) => (
-              <View key={idx} style={styles.routeCard}>
+            {routes.map(route => (
+              <View key={route.id} style={styles.routeCard}>
                 <View style={styles.routeCardHeader}>
                   <Text style={styles.routeCardTitle}>{route.teamName}</Text>
                   <View style={styles.activeBadge}>
@@ -435,8 +525,20 @@ export function HomeScreen() {
                 <View style={styles.separator} />
                 
                 <View style={styles.routeActions}>
-                  <Pressable style={styles.actionButton} onPress={() => handleSimulation(route)}>
-                    <Text style={styles.actionButtonText}>Test Route</Text>
+                  <Pressable
+                    style={styles.actionButton}
+                    onPress={() => handleSimulation(route)}
+                    disabled={activeRouteId === route.id}
+                  >
+                    <Text style={styles.actionButtonText}>
+                      {activeRouteId === route.id ? 'Sending...' : 'Test Route'}
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.actionButton, styles.deleteActionButton]}
+                    onPress={() => handleDeleteRoute(route.id)}
+                  >
+                    <Text style={styles.actionButtonText}>Delete</Text>
                   </Pressable>
                 </View>
               </View>
@@ -519,6 +621,20 @@ const styles = StyleSheet.create({
     borderColor: palette.border,
     padding: 20,
     marginTop: 20,
+  },
+  feedbackBanner: {
+    backgroundColor: palette.accentLight,
+    borderWidth: 1,
+    borderColor: palette.border,
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 20,
+  },
+  feedbackBannerText: {
+    color: palette.textSecondary,
+    fontSize: 13,
+    fontWeight: '600',
+    lineHeight: 18,
   },
   cardEyebrow: {
     fontSize: 11,
@@ -638,12 +754,16 @@ const styles = StyleSheet.create({
   routeActions: {
     flexDirection: 'row',
     justifyContent: 'flex-end',
+    gap: 12,
   },
   actionButton: {
     backgroundColor: palette.accentLight,
     paddingVertical: 8,
     paddingHorizontal: 16,
     borderRadius: 8,
+  },
+  deleteActionButton: {
+    backgroundColor: '#3a1620',
   },
   actionButtonText: {
     color: palette.textPrimary,

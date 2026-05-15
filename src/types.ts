@@ -6,6 +6,10 @@ export type ReceiverForm = {
   senderFilter: string;
 };
 
+export type StoredRoute = ReceiverForm & {
+  id: string;
+};
+
 export type SmsEventPreview = {
   sender: string;
   message: string;
