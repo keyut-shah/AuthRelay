@@ -1,7 +1,7 @@
 import { NativeModules } from 'react-native';
 import { createMMKV, type MMKV } from 'react-native-mmkv';
-import { StorageKeys } from './keys';
-import type { ReceiverForm, StoredRoute } from '../types';
+import { EVENT_HISTORY_CAP, StorageKeys } from './keys';
+import type { ProcessedMessageEvent, ReceiverForm, StoredRoute } from '../types';
 
 export const STORAGE_ID = 'msg-forwarder-storage';
 
@@ -77,4 +77,43 @@ export const StorageHelpers = {
     StorageHelpers.saveRoutes(routes);
     return routes;
   },
+
+  getEvents: (): ProcessedMessageEvent[] => {
+    const data = requireStorage().getString(StorageKeys.EVENTS);
+    if (!data) return [];
+    try {
+      const parsed = JSON.parse(data) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(isProcessedMessageEvent);
+    } catch (e) {
+      console.error('Failed to parse events from MMKV', e);
+      return [];
+    }
+  },
+
+  appendEvent: (event: ProcessedMessageEvent) => {
+    const events = StorageHelpers.getEvents();
+    events.unshift(event);
+    if (events.length > EVENT_HISTORY_CAP) {
+      events.length = EVENT_HISTORY_CAP;
+    }
+    requireStorage().set(StorageKeys.EVENTS, JSON.stringify(events));
+    return events;
+  },
+
+  clearEvents: () => {
+    requireStorage().set(StorageKeys.EVENTS, JSON.stringify([]));
+  },
 };
+
+function isProcessedMessageEvent(value: unknown): value is ProcessedMessageEvent {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.id === 'string' &&
+    typeof v.createdAt === 'number' &&
+    typeof v.sender === 'string' &&
+    (v.status === 'sent' || v.status === 'failed' || v.status === 'ignored') &&
+    (v.maskedCode === null || typeof v.maskedCode === 'string')
+  );
+}

@@ -20,10 +20,13 @@ import {
   simulateIncomingSms,
   subscribeToIncomingSms,
 } from '../native/smsRouter';
+import { extractOtp, maskMessagePreview } from '../services/otp';
 import { sendTelegramMessage } from '../services/telegram';
 import { StorageHelpers } from '../storage';
 import { palette } from '../theme';
 import type { ReceiverForm, SmsEventPreview, StoredRoute } from '../types';
+
+import { useNavigation } from '@react-navigation/native';
 
 const stepLabels = ['Overview', 'Permissions', 'Telegram', 'Routing'];
 
@@ -53,6 +56,25 @@ export function HomeScreen() {
   const [latestEvent, setLatestEvent] = useState<SmsEventPreview | null>(null);
   const [activeRouteId, setActiveRouteId] = useState<string | null>(null);
   const [telegramStatus, setTelegramStatus] = useState<string | null>(null);
+
+  const navigation = useNavigation();
+
+  // Hide the bottom tab bar while the wizard is open so it doesn't fight
+  // the wizard's own footer button for space.
+  useEffect(() => {
+    const parent = navigation.getParent();
+    parent?.setOptions({
+      tabBarStyle: showWizard
+        ? { display: 'none' }
+        : {
+            backgroundColor: palette.panel,
+            borderTopColor: palette.border,
+            height: 64,
+            paddingTop: 6,
+            paddingBottom: 8,
+          },
+    });
+  }, [navigation, showWizard]);
 
   useEffect(() => {
     // 1. Check existing SMS permission state so toggle reflects reality
@@ -431,7 +453,13 @@ export function HomeScreen() {
           {latestEvent ? (
             <View style={styles.eventBox}>
               <Text style={styles.eventSender}>{latestEvent.sender}</Text>
-              <Text style={styles.eventMessage}>{latestEvent.message}</Text>
+              <Text style={styles.eventMessage}>{maskMessagePreview(latestEvent.message)}</Text>
+              {(() => {
+                const otp = extractOtp(latestEvent.message);
+                return otp.maskedCode ? (
+                  <Text style={styles.eventCode}>Code: {otp.maskedCode}</Text>
+                ) : null;
+              })()}
               <Text style={styles.eventTime}>Source: {latestEvent.source}</Text>
             </View>
           ) : (
@@ -624,6 +652,13 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: palette.textSecondary,
     lineHeight: 20,
+    marginBottom: 8,
+  },
+  eventCode: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: palette.textPrimary,
+    letterSpacing: 1,
     marginBottom: 8,
   },
   eventTime: {

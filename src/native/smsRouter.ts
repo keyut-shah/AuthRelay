@@ -64,3 +64,16 @@ export function subscribeToIncomingSms(
 
   return eventEmitter.addListener('otpRouter:smsReceived', listener);
 }
+
+/**
+ * Fires whenever the native dispatcher appends a ProcessedMessageEvent
+ * to MMKV (after every send / failed / ignored outcome). The listener
+ * should reload the event list from storage.
+ */
+export function subscribeToEventHistoryUpdated(listener: () => void) {
+  if (!eventEmitter) {
+    return { remove: () => undefined };
+  }
+
+  return eventEmitter.addListener('otpRouter:eventHistoryUpdated', listener);
+}
