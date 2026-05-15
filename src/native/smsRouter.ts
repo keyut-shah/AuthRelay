@@ -36,19 +36,11 @@ export async function requestSmsPermission() {
     return false;
   }
 
-  const results = await PermissionsAndroid.requestMultiple([
+  const result = await PermissionsAndroid.request(
     PermissionsAndroid.PERMISSIONS.RECEIVE_SMS,
-    PermissionsAndroid.PERMISSIONS.READ_SMS,
-  ]);
+  );
 
-  const receiveGranted =
-    results[PermissionsAndroid.PERMISSIONS.RECEIVE_SMS] ===
-    PermissionsAndroid.RESULTS.GRANTED;
-  const readGranted =
-    results[PermissionsAndroid.PERMISSIONS.READ_SMS] ===
-    PermissionsAndroid.RESULTS.GRANTED;
-
-  return receiveGranted && readGranted;
+  return result === PermissionsAndroid.RESULTS.GRANTED;
 }
 
 export async function getListenerStatus(): Promise<ListenerStatus | null> {

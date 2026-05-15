@@ -3,6 +3,7 @@
  */
 
 import React from 'react';
+import { NativeModules } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import App from '../App';
 
@@ -18,6 +19,18 @@ jest.mock('react-native-mmkv', () => {
     }),
   };
 });
+
+(NativeModules as { SmsRouterModule?: unknown }).SmsRouterModule = {
+  getEncryptionKey: jest.fn().mockResolvedValue('test-passphrase'),
+  getListenerStatus: jest.fn().mockResolvedValue({
+    receiverRegistered: true,
+    bootRecoveryEnabled: true,
+    foregroundServiceEnabled: false,
+  }),
+  simulateIncomingSms: jest.fn(),
+  addListener: jest.fn(),
+  removeListeners: jest.fn(),
+};
 
 test('renders correctly', async () => {
   await ReactTestRenderer.act(() => {

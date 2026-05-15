@@ -20,12 +20,7 @@ import {
   simulateIncomingSms,
   subscribeToIncomingSms,
 } from '../native/smsRouter';
-import type { IncomingSmsEvent } from '../native/smsRouter';
-import {
-  doesRouteMatchSender,
-  forwardSmsToTelegramRoute,
-  sendTelegramMessage,
-} from '../services/telegram';
+import { sendTelegramMessage } from '../services/telegram';
 import { StorageHelpers } from '../storage';
 import { palette } from '../theme';
 import type { ReceiverForm, SmsEventPreview, StoredRoute } from '../types';
@@ -59,35 +54,6 @@ export function HomeScreen() {
   const [activeRouteId, setActiveRouteId] = useState<string | null>(null);
   const [telegramStatus, setTelegramStatus] = useState<string | null>(null);
 
-  const forwardIncomingSms = async (event: IncomingSmsEvent) => {
-    const latestRoutes = StorageHelpers.getRoutes();
-    const matchingRoutes = latestRoutes.filter(route =>
-      doesRouteMatchSender(route, event.sender),
-    );
-
-    if (matchingRoutes.length === 0) {
-      return;
-    }
-
-    const results = await Promise.allSettled(
-      matchingRoutes.map(route => forwardSmsToTelegramRoute(route, event)),
-    );
-
-    const deliveredCount = results.filter(result => result.status === 'fulfilled').length;
-    const failedResult = results.find(result => result.status === 'rejected');
-
-    if (failedResult?.status === 'rejected') {
-      const message =
-        failedResult.reason instanceof Error
-          ? failedResult.reason.message
-          : 'Unable to forward message to Telegram.';
-      setTelegramStatus(`Telegram forward failed: ${message}`);
-      return;
-    }
-
-    setTelegramStatus(`Forwarded to ${deliveredCount} Telegram route${deliveredCount === 1 ? '' : 's'}.`);
-  };
-
   useEffect(() => {
     // 1. Check existing SMS permission state so toggle reflects reality
     const checkPermissions = async () => {
@@ -95,10 +61,7 @@ export function HomeScreen() {
       const receive = await PermissionsAndroid.check(
         PermissionsAndroid.PERMISSIONS.RECEIVE_SMS,
       );
-      const read = await PermissionsAndroid.check(
-        PermissionsAndroid.PERMISSIONS.READ_SMS,
-      );
-      if (receive && read) {
+      if (receive) {
         setHasSmsPermission(true);
       } else {
         // Auto-prompt on first launch so user sees the system dialog immediately
@@ -127,14 +90,11 @@ export function HomeScreen() {
       setListenerHealth('Unable to verify listener status');
     });
 
-    // 3. Subscribe to live SMS events
+    // 3. Subscribe to live SMS events for display only.
+    // Actual Telegram forwarding is handled natively (SmsDispatcher.kt) so it
+    // keeps working when the JS bundle is dead.
     const subscription = subscribeToIncomingSms(event => {
       setLatestEvent(event);
-      forwardIncomingSms(event).catch(error => {
-        const message =
-          error instanceof Error ? error.message : 'Unable to forward message to Telegram.';
-        setTelegramStatus(`Telegram forward failed: ${message}`);
-      });
     });
 
     return () => {
@@ -162,10 +122,13 @@ export function HomeScreen() {
 
   const finishSetup = () => {
     if (!canFinishSetup) return;
+    const trimmedFilter = receiverForm.senderFilter.trim();
+    if (trimmedFilter.length === 0) return;
     const updatedRoutes = [
       ...routes,
       {
         ...receiverForm,
+        senderFilter: trimmedFilter,
         id: `route_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
       },
     ];
@@ -268,7 +231,7 @@ export function HomeScreen() {
             <Text style={styles.stepDescription}>
               To reliably forward messages, AuthRelay needs background execution and SMS permissions.
             </Text>
-            
+
             <View style={styles.permissionCard}>
               <View style={styles.permissionHeader}>
                 <View>
@@ -282,9 +245,9 @@ export function HomeScreen() {
                   thumbColor={palette.panel}
                 />
               </View>
-              
+
               <View style={styles.separator} />
-              
+
               <View style={styles.permissionHeader}>
                 <View>
                   <Text style={styles.permissionTitle}>Battery Unrestricted</Text>
@@ -297,9 +260,9 @@ export function HomeScreen() {
                   thumbColor={palette.panel}
                 />
               </View>
-              
+
               <View style={styles.separator} />
-              
+
               <View style={styles.permissionHeader}>
                 <View>
                   <Text style={styles.permissionTitle}>Auto-start (OEM)</Text>
@@ -322,7 +285,7 @@ export function HomeScreen() {
             <Text style={styles.stepDescription}>
               Provide the credentials for the Telegram bot that will dispatch the messages.
             </Text>
-            
+
             <View style={styles.inputWrapper}>
               <Text style={styles.inputLabel}>Receiver Name</Text>
               <TextInput
@@ -333,7 +296,7 @@ export function HomeScreen() {
                 onChangeText={val => updateForm('telegramName', val)}
               />
             </View>
-            
+
             <View style={styles.inputWrapper}>
               <Text style={styles.inputLabel}>Bot Token</Text>
               <TextInput
@@ -346,7 +309,7 @@ export function HomeScreen() {
                 autoCapitalize="none"
               />
             </View>
-            
+
             <View style={styles.inputWrapper}>
               <Text style={styles.inputLabel}>Chat ID</Text>
               <TextInput
@@ -367,7 +330,7 @@ export function HomeScreen() {
             <Text style={styles.stepDescription}>
               Define which messages should be forwarded based on the sender's ID.
             </Text>
-            
+
             <View style={styles.inputWrapper}>
               <Text style={styles.inputLabel}>Allowed Sender</Text>
               <TextInput
@@ -405,8 +368,8 @@ export function HomeScreen() {
   if (showWizard) {
     return (
       <SafeAreaView style={styles.container}>
-        <KeyboardAvoidingView 
-          style={styles.container} 
+        <KeyboardAvoidingView
+          style={styles.container}
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         >
           <View style={styles.wizardHeader}>
@@ -415,12 +378,12 @@ export function HomeScreen() {
             </Pressable>
             <View style={styles.progressPills}>
               {stepLabels.map((_, idx) => (
-                <View 
-                  key={idx} 
+                <View
+                  key={idx}
                   style={[
-                    styles.progressPill, 
+                    styles.progressPill,
                     idx <= currentStep && styles.progressPillActive
-                  ]} 
+                  ]}
                 />
               ))}
             </View>
@@ -432,11 +395,11 @@ export function HomeScreen() {
           </ScrollView>
 
           <View style={styles.footer}>
-            <Pressable 
+            <Pressable
               style={[
                 styles.primaryButton,
                 currentStep === 3 && !canFinishSetup && styles.buttonDisabled
-              ]} 
+              ]}
               onPress={goNext}
             >
               <Text style={styles.primaryButtonText}>
@@ -461,7 +424,7 @@ export function HomeScreen() {
       </View>
 
       <ScrollView style={styles.scrollArea} contentContainerStyle={styles.homeScrollContent}>
-        
+
         {/* Latest Event Card */}
         <View style={styles.card}>
           <Text style={styles.cardEyebrow}>LATEST INTERCEPTION</Text>
@@ -510,7 +473,7 @@ export function HomeScreen() {
                     <Text style={styles.activeBadgeText}>ACTIVE</Text>
                   </View>
                 </View>
-                
+
                 <View style={styles.routeDetails}>
                   <View style={styles.routeDetailItem}>
                     <Text style={styles.detailLabel}>Sender</Text>
@@ -521,9 +484,9 @@ export function HomeScreen() {
                     <Text style={styles.detailValue}>Telegram ({route.telegramName})</Text>
                   </View>
                 </View>
-                
+
                 <View style={styles.separator} />
-                
+
                 <View style={styles.routeActions}>
                   <Pressable
                     style={styles.actionButton}
@@ -543,7 +506,7 @@ export function HomeScreen() {
                 </View>
               </View>
             ))}
-            
+
             <Pressable style={styles.secondaryButton} onPress={startNewRoute}>
               <Text style={styles.secondaryButtonText}>+ Add Another Route</Text>
             </Pressable>
@@ -763,7 +726,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   deleteActionButton: {
-    backgroundColor: '#3a1620',
+    backgroundColor: '#e63946',
   },
   actionButtonText: {
     color: palette.textPrimary,

@@ -111,6 +111,14 @@ dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
 
+    // Used by SmsDispatcher to post OTPs to Telegram from native code so
+    // routing keeps working when the JS bundle is not running.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // MMKV — required by SmsDispatcher to read routes from the same encrypted
+    // storage that the JS layer writes to via react-native-mmkv.
+    implementation("io.github.zhongwuzw:mmkv:2.4.0")
+
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
     } else {

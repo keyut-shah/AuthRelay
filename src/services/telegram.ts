@@ -24,8 +24,9 @@ export function doesRouteMatchSender(route: StoredRoute, sender: string) {
   const normalizedFilter = route.senderFilter.trim().toLowerCase();
   const normalizedSender = sender.trim().toLowerCase();
 
+  // Whitelist-only: an empty/missing filter must never forward.
   if (normalizedFilter.length === 0) {
-    return true;
+    return false;
   }
 
   return normalizedSender.includes(normalizedFilter);

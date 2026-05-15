@@ -1,10 +1,40 @@
-import { createMMKV } from 'react-native-mmkv';
+import { NativeModules } from 'react-native';
+import { createMMKV, type MMKV } from 'react-native-mmkv';
 import { StorageKeys } from './keys';
 import type { ReceiverForm, StoredRoute } from '../types';
 
-export const storage = createMMKV({
-  id: 'msg-forwarder-storage',
-});
+export const STORAGE_ID = 'msg-forwarder-storage';
+
+type SmsRouterNativeModule = {
+  getEncryptionKey(): Promise<string>;
+};
+
+let storage: MMKV | null = null;
+let initPromise: Promise<void> | null = null;
+
+export function initStorage(): Promise<void> {
+  if (storage) return Promise.resolve();
+  if (initPromise) return initPromise;
+
+  initPromise = (async () => {
+    const native = (NativeModules as { SmsRouterModule?: SmsRouterNativeModule })
+      .SmsRouterModule;
+    if (!native) {
+      throw new Error('SmsRouterModule native module is not linked.');
+    }
+    const encryptionKey = await native.getEncryptionKey();
+    storage = createMMKV({ id: STORAGE_ID, encryptionKey });
+  })();
+
+  return initPromise;
+}
+
+function requireStorage(): MMKV {
+  if (!storage) {
+    throw new Error('Storage not initialized — call initStorage() first.');
+  }
+  return storage;
+}
 
 const createRouteId = () =>
   `route_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
@@ -16,10 +46,10 @@ const normalizeRoute = (route: ReceiverForm | StoredRoute): StoredRoute => ({
 
 export const StorageHelpers = {
   saveRoutes: (routes: StoredRoute[]) => {
-    storage.set(StorageKeys.ROUTES, JSON.stringify(routes));
+    requireStorage().set(StorageKeys.ROUTES, JSON.stringify(routes));
   },
   getRoutes: (): StoredRoute[] => {
-    const data = storage.getString(StorageKeys.ROUTES);
+    const data = requireStorage().getString(StorageKeys.ROUTES);
     if (!data) {
       return [];
     }

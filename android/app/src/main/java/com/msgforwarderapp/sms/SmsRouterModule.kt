@@ -25,6 +25,15 @@ class SmsRouterModule(private val reactContext: ReactApplicationContext) :
   }
 
   @ReactMethod
+  fun getEncryptionKey(promise: Promise) {
+    try {
+      promise.resolve(SecureStore.getMmkvPassphrase(reactContext))
+    } catch (t: Throwable) {
+      promise.reject("E_SECURE_STORE", t.message, t)
+    }
+  }
+
+  @ReactMethod
   fun simulateIncomingSms(sender: String, message: String) {
     emitIncomingSms(sender = sender, message = message, source = "simulation")
   }
