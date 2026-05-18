@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   AppState,
@@ -13,41 +13,49 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useNavigation } from '@react-navigation/native';
 
 import {
   checkSmsPermission,
   getListenerStatus,
   isIgnoringBatteryOptimizations,
   openAutostartSettings,
+  pickContact,
   requestIgnoreBatteryOptimizations,
   requestSmsPermission,
   simulateIncomingSms,
   subscribeToIncomingSms,
 } from '../native/smsRouter';
 import type { ListenerStatus } from '../native/smsRouter';
-import { ReceiverFormSchema } from '../schemas';
+import { RouteFormSchema } from '../schemas';
+import { buildTelegramDestinationName, getDestinationDisplayName } from '../services/destinations';
 import { testDestination } from '../services/integrations';
 import { extractOtp, maskMessagePreview } from '../services/otp';
+import { describeSenderRule, parsePhraseList } from '../services/routing';
 import { StorageHelpers } from '../storage';
 import { palette } from '../theme';
 import type {
   DestinationConfig,
-  ReceiverForm,
+  RouteForm,
   RouteRule,
   RouteRuleView,
   SmsEventPreview,
 } from '../types';
 
-import { useNavigation } from '@react-navigation/native';
+const stepLabels = ['Route', 'Permissions', 'Telegram', 'Rules', 'Review'];
 
-const stepLabels = ['Overview', 'Permissions', 'Telegram', 'Routing'];
-
-const initialForm: ReceiverForm = {
-  teamName: '',
-  telegramName: '',
+const initialForm: RouteForm = {
+  routeName: '',
   telegramBotToken: '',
   telegramChatId: '',
-  senderFilter: '',
+  senderSourceType: 'sender_id',
+  senderPattern: '',
+  contactDisplayName: '',
+  contactPhoneNumbers: [],
+  useMessageFilters: false,
+  messageFilterMode: 'include',
+  messageAllowInput: '',
+  messageBlockInput: '',
 };
 
 function buildRuleViews(
@@ -67,26 +75,102 @@ function formatRelative(ms: number): string {
   return new Date(ms).toLocaleString();
 }
 
+function buildRuleNarrative(form: RouteForm): string {
+  const destinationName = buildTelegramDestinationName(form.telegramChatId);
+  const source =
+    form.senderSourceType === 'any'
+      ? 'every sender on this device'
+      : form.senderSourceType === 'contact'
+        ? form.contactDisplayName
+          ? `${form.contactDisplayName} (${form.contactPhoneNumbers[0] || 'no number'})`
+          : 'a saved contact'
+        : form.senderPattern
+          ? `sender IDs or numbers containing "${form.senderPattern.trim()}"`
+          : 'a sender ID or number';
+
+  const allowPatterns = parsePhraseList(form.messageAllowInput);
+  const blockPatterns = parsePhraseList(form.messageBlockInput);
+
+  let messageRule = 'Any OTP from that source will be forwarded.';
+  if (form.useMessageFilters) {
+    if (allowPatterns.length > 0 && blockPatterns.length > 0) {
+      messageRule = `Only if the message contains ${allowPatterns.map(item => `"${item}"`).join(', ')} and does not contain ${blockPatterns.map(item => `"${item}"`).join(', ')}.`;
+    } else if (allowPatterns.length > 0) {
+      messageRule = `Only if the message contains ${allowPatterns
+        .map(item => `"${item}"`)
+        .join(', ')}.`;
+    } else if (blockPatterns.length > 0) {
+      messageRule = `Only if the message does not contain ${blockPatterns
+        .map(item => `"${item}"`)
+        .join(', ')}.`;
+    }
+  }
+
+  return `Forward OTPs from ${source} to ${destinationName}. ${messageRule}`;
+}
+
+function formatPhoneSummary(phoneNumbers: string[]): string {
+  if (phoneNumbers.length === 0) return 'No saved numbers';
+  return phoneNumbers
+    .map(number => {
+      const digits = number.replace(/\D/g, '');
+      if (digits.length <= 4) return number;
+      return `••${digits.slice(-4)}`;
+    })
+    .join(', ');
+}
+
+function summarizeFilters(rule: RouteRule): string {
+  if (rule.messageAllowPatterns.length === 0 && rule.messageBlockPatterns.length === 0) {
+    return 'Any matched OTP';
+  }
+
+  if (rule.messageAllowPatterns.length > 0 && rule.messageBlockPatterns.length > 0) {
+    return `Include: ${rule.messageAllowPatterns.join(', ')} · Exclude: ${rule.messageBlockPatterns.join(', ')}`;
+  }
+
+  if (rule.messageAllowPatterns.length > 0) {
+    return `Include: ${rule.messageAllowPatterns.join(', ')}`;
+  }
+
+  return `Exclude: ${rule.messageBlockPatterns.join(', ')}`;
+}
+
+function buildSimulationMessage(rule: RouteRule): string {
+  const includeHint = rule.messageAllowPatterns[0];
+  const suffix = includeHint ? ` ${includeHint}.` : '';
+  return `Your ${rule.routeName} code is 123456. Never share this code with anyone.${suffix}`;
+}
+
+function buildSimulationSender(rule: RouteRule): string {
+  if (rule.senderSourceType === 'contact' && rule.contactPhoneNumbers[0]) {
+    return rule.contactPhoneNumbers[0];
+  }
+  if (rule.senderSourceType === 'sender_id' && rule.senderPattern) {
+    return rule.senderPattern;
+  }
+  return 'TEST-SENDER';
+}
+
 export function HomeScreen() {
   const [rules, setRules] = useState<RouteRule[]>(StorageHelpers.getRules());
   const [destinations, setDestinations] = useState<DestinationConfig[]>(
     StorageHelpers.getDestinations(),
   );
-  const ruleViews = buildRuleViews(rules, destinations);
+  const ruleViews = useMemo(() => buildRuleViews(rules, destinations), [rules, destinations]);
 
   const [showWizard, setShowWizard] = useState(false);
   const [currentStep, setCurrentStep] = useState(0);
 
-  // Permissions & Settings
   const [hasSmsPermission, setHasSmsPermission] = useState(false);
   const [ignoreBatteryOptimizations, setIgnoreBatteryOptimizations] = useState(false);
   const [autostartAttempted, setAutostartAttempted] = useState(false);
 
-  // Form State
-  const [receiverForm, setReceiverForm] = useState(initialForm);
-  const [formErrors, setFormErrors] = useState<Partial<Record<keyof ReceiverForm, string>>>({});
+  const [routeForm, setRouteForm] = useState(initialForm);
+  const [formErrors, setFormErrors] = useState<Partial<Record<keyof RouteForm, string>>>({});
 
-  // Listener & Events
+  const [contactPickerBusy, setContactPickerBusy] = useState(false);
+
   const [listenerStatus, setListenerStatus] = useState<ListenerStatus | null>(null);
   const [listenerHealth, setListenerHealth] = useState('Checking listener status...');
   const [latestEvent, setLatestEvent] = useState<SmsEventPreview | null>(null);
@@ -95,8 +179,6 @@ export function HomeScreen() {
 
   const navigation = useNavigation();
 
-  // Hide the bottom tab bar while the wizard is open so it doesn't fight
-  // the wizard's own footer button for space.
   useEffect(() => {
     const parent = navigation.getParent();
     parent?.setOptions({
@@ -112,24 +194,22 @@ export function HomeScreen() {
     });
   }, [navigation, showWizard]);
 
-  // Reload all system state (permissions, battery, listener) on mount and
-  // whenever the app returns to foreground — covers the case where the user
-  // toggled a setting in Android Settings while the app was backgrounded.
   useEffect(() => {
     const reloadSystemState = async () => {
       try {
-        const [permission, status, battery] = await Promise.all([
+        const [smsPermission, status, battery] = await Promise.all([
           checkSmsPermission(),
           getListenerStatus(),
           isIgnoringBatteryOptimizations(),
         ]);
-        setHasSmsPermission(permission);
+        setHasSmsPermission(smsPermission);
         setIgnoreBatteryOptimizations(battery);
+
         if (status) {
           setListenerStatus(status);
           setAutostartAttempted(status.autostartAttemptedAt > 0);
           setListenerHealth(
-            permission
+            smsPermission
               ? status.bootRestoredAt > 0
                 ? `Active · restored after reboot ${formatRelative(status.bootRestoredAt)}`
                 : 'Active'
@@ -149,9 +229,6 @@ export function HomeScreen() {
       if (state === 'active') reloadSystemState();
     });
 
-    // Subscribe to live SMS events for display only.
-    // Actual Telegram forwarding is handled natively (SmsDispatcher.kt) so it
-    // keeps working when the JS bundle is dead.
     const subscription = subscribeToIncomingSms(event => {
       setLatestEvent(event);
     });
@@ -162,8 +239,8 @@ export function HomeScreen() {
     };
   }, []);
 
-  const updateForm = <K extends keyof ReceiverForm>(key: K, value: ReceiverForm[K]) => {
-    setReceiverForm(prev => ({ ...prev, [key]: value }));
+  const updateForm = <K extends keyof RouteForm>(key: K, value: RouteForm[K]) => {
+    setRouteForm(prev => ({ ...prev, [key]: value }));
     if (formErrors[key]) {
       setFormErrors(prev => {
         const next = { ...prev };
@@ -173,80 +250,20 @@ export function HomeScreen() {
     }
   };
 
+  const clearContactErrors = () => {
+    setFormErrors(prev => {
+      const next = { ...prev };
+      delete next.contactDisplayName;
+      delete next.contactPhoneNumbers;
+      return next;
+    });
+  };
+
   const startNewRoute = () => {
-    setReceiverForm(initialForm);
+    setRouteForm(initialForm);
+    setFormErrors({});
     setCurrentStep(0);
     setShowWizard(true);
-  };
-
-  const finishSetup = () => {
-    // zod is the source of truth for whether the form is acceptable.
-    const result = ReceiverFormSchema.safeParse(receiverForm);
-    if (!result.success) {
-      const fieldErrors: Partial<Record<keyof ReceiverForm, string>> = {};
-      const flat = result.error.flatten().fieldErrors;
-      (Object.keys(flat) as (keyof ReceiverForm)[]).forEach(key => {
-        const msg = flat[key]?.[0];
-        if (msg) fieldErrors[key] = msg;
-      });
-      setFormErrors(fieldErrors);
-      // Jump back to the first step that has an error.
-      if (fieldErrors.teamName) setCurrentStep(0);
-      else if (fieldErrors.telegramName || fieldErrors.telegramBotToken || fieldErrors.telegramChatId) setCurrentStep(2);
-      else if (fieldErrors.senderFilter) setCurrentStep(3);
-      return;
-    }
-    if (!hasSmsPermission) {
-      Alert.alert('Permission required', 'Grant SMS access before creating a route.');
-      setCurrentStep(1);
-      return;
-    }
-
-    const clean = result.data;
-
-    // Create a fresh destination + rule pair. Reusing an existing destination
-    // across rules is a follow-up feature (the data model supports it).
-    const destination: DestinationConfig = {
-      id: StorageHelpers.newDestinationId(),
-      name: clean.telegramName,
-      provider: {
-        type: 'telegram',
-        botToken: clean.telegramBotToken,
-        chatId: clean.telegramChatId,
-      },
-    };
-    const rule: RouteRule = {
-      id: StorageHelpers.newRuleId(),
-      enabled: true,
-      teamName: clean.teamName,
-      senderPattern: clean.senderFilter,
-      senderMatchMode: 'contains',
-      destinationId: destination.id,
-    };
-
-    const updatedDestinations = StorageHelpers.upsertDestination(destination);
-    const updatedRules = StorageHelpers.upsertRule(rule);
-    setDestinations(updatedDestinations);
-    setRules(updatedRules);
-    setReceiverForm(initialForm);
-    setFormErrors({});
-    setShowWizard(false);
-  };
-
-  const goNext = () => {
-    if (currentStep < stepLabels.length - 1) {
-      setCurrentStep(prev => prev + 1);
-    } else {
-      finishSetup();
-    }
-  };
-
-  const goBack = () => {
-    if (currentStep > 0) {
-      setCurrentStep(prev => prev - 1);
-    } else {
-      setShowWizard(false);
-    }
   };
 
   const handlePermissionRequest = async () => {
@@ -257,6 +274,7 @@ export function HomeScreen() {
       );
       return;
     }
+
     const granted = await requestSmsPermission();
     setHasSmsPermission(granted);
     if (!granted) {
@@ -279,8 +297,6 @@ export function HomeScreen() {
     if (alreadyExempt) {
       setIgnoreBatteryOptimizations(true);
     }
-    // Otherwise the system dialog is now visible — when the user returns to
-    // the app, the AppState listener re-reads the actual value.
   };
 
   const handleAutostartTrigger = async () => {
@@ -294,234 +310,678 @@ export function HomeScreen() {
     }
   };
 
+  const handleSenderSourceChange = (value: RouteForm['senderSourceType']) => {
+    updateForm('senderSourceType', value);
+    if (value === 'contact') clearContactErrors();
+  };
+
+  const handlePickContact = async () => {
+    if (contactPickerBusy) return;
+    setContactPickerBusy(true);
+    try {
+      const picked = await pickContact();
+      if (!picked) return; // user cancelled
+      setRouteForm(prev => ({
+        ...prev,
+        contactDisplayName: picked.displayName,
+        contactPhoneNumbers: [picked.phoneNumber],
+      }));
+      clearContactErrors();
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Unable to open the contact picker.';
+      Alert.alert('Contact picker unavailable', message);
+    } finally {
+      setContactPickerBusy(false);
+    }
+  };
+
+  const jumpToFirstErrorStep = (errors: Partial<Record<keyof RouteForm, string>>) => {
+    if (errors.routeName) {
+      setCurrentStep(0);
+      return;
+    }
+
+    if (errors.telegramBotToken || errors.telegramChatId) {
+      setCurrentStep(2);
+      return;
+    }
+
+    setCurrentStep(3);
+  };
+
+  const finishSetup = () => {
+    const result = RouteFormSchema.safeParse(routeForm);
+    if (!result.success) {
+      const fieldErrors: Partial<Record<keyof RouteForm, string>> = {};
+      const flat = result.error.flatten().fieldErrors;
+      (Object.keys(flat) as (keyof RouteForm)[]).forEach(key => {
+        const message = flat[key]?.[0];
+        if (message) fieldErrors[key] = message;
+      });
+      setFormErrors(fieldErrors);
+      jumpToFirstErrorStep(fieldErrors);
+      return;
+    }
+
+    if (!hasSmsPermission) {
+      Alert.alert('Permission required', 'Grant SMS access before creating a route.');
+      setCurrentStep(1);
+      return;
+    }
+
+    const clean = result.data;
+    const destinationName = buildTelegramDestinationName(clean.telegramChatId);
+    const destination: DestinationConfig = {
+      id: StorageHelpers.newDestinationId(),
+      name: destinationName,
+      provider: {
+        type: 'telegram',
+        botToken: clean.telegramBotToken,
+        chatId: clean.telegramChatId,
+      },
+    };
+
+    const rule: RouteRule = {
+      id: StorageHelpers.newRuleId(),
+      enabled: true,
+      routeName: clean.routeName,
+      senderSourceType: clean.senderSourceType,
+      senderPattern: clean.senderSourceType === 'sender_id' ? clean.senderPattern.trim() : '',
+      contactDisplayName:
+        clean.senderSourceType === 'contact' ? clean.contactDisplayName : null,
+      contactPhoneNumbers:
+        clean.senderSourceType === 'contact'
+          ? clean.contactPhoneNumbers.map(p => p.trim()).filter(Boolean)
+          : [],
+      messageAllowPatterns:
+        clean.useMessageFilters && clean.messageFilterMode !== 'exclude'
+          ? parsePhraseList(clean.messageAllowInput)
+          : [],
+      messageBlockPatterns:
+        clean.useMessageFilters && clean.messageFilterMode !== 'include'
+          ? parsePhraseList(clean.messageBlockInput)
+          : [],
+      destinationId: destination.id,
+    };
+
+    const updatedDestinations = StorageHelpers.upsertDestination(destination);
+    const updatedRules = StorageHelpers.upsertRule(rule);
+    setDestinations(updatedDestinations);
+    setRules(updatedRules);
+    setRouteForm(initialForm);
+    setFormErrors({});
+    setShowWizard(false);
+  };
+
+  const goNext = () => {
+    if (currentStep < stepLabels.length - 1) {
+      setCurrentStep(prev => prev + 1);
+      return;
+    }
+    finishSetup();
+  };
+
+  const goBack = () => {
+    if (currentStep > 0) {
+      setCurrentStep(prev => prev - 1);
+      return;
+    }
+    setShowWizard(false);
+  };
+
   const handleTestRule = async ({ rule, destination }: RouteRuleView) => {
     if (!destination) {
       Alert.alert('Destination Missing', 'This rule has no destination configured.');
       return;
     }
-    const sender = rule.senderPattern || 'TEST-SENDER';
-    const team = rule.teamName || 'Ops';
+
+    const sender = buildSimulationSender(rule);
+    const routeName = rule.routeName || 'Route';
     setActiveRuleId(rule.id);
-    setTelegramStatus(`Sending Telegram test for ${team}...`);
+    setTelegramStatus(`Sending Telegram test for ${routeName}...`);
 
     try {
       await testDestination(destination);
-      setTelegramStatus(`Telegram test sent successfully for ${team}.`);
+      setTelegramStatus(`Telegram test sent successfully for ${routeName}.`);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : 'Unable to send test message.';
       Alert.alert('Telegram Test Failed', message);
-      setTelegramStatus(`Telegram test failed for ${team}: ${message}`);
+      setTelegramStatus(`Telegram test failed for ${routeName}: ${message}`);
       return;
     } finally {
       setActiveRuleId(null);
     }
 
-    simulateIncomingSms(
-      sender,
-      `Your ${team} code is 123456. Never share this code with anyone.`,
-    );
+    simulateIncomingSms(sender, buildSimulationMessage(rule));
   };
 
   const handleDeleteRule = (ruleId: string) => {
     const updatedRules = StorageHelpers.removeRule(ruleId);
     setRules(updatedRules);
-    // Note: we intentionally don't auto-delete the orphan destination, so the
-    // user can reuse it for a different rule later. A "manage destinations"
-    // screen can clean these up.
+  };
+
+  const renderRouteDetailsStep = () => (
+    <View style={styles.stepContent}>
+      <Text style={styles.stepTitle}>Route Details</Text>
+      <Text style={styles.stepDescription}>
+        Give this forwarding rule a label that only appears inside the app so you can
+        identify it later.
+      </Text>
+
+      <View style={styles.inputWrapper}>
+        <Text style={styles.inputLabel}>Route Name</Text>
+        <TextInput
+          style={[styles.input, formErrors.routeName && styles.inputError]}
+          placeholder="e.g., Finance Login OTPs"
+          placeholderTextColor={palette.textMuted}
+          value={routeForm.routeName}
+          onChangeText={value => updateForm('routeName', value)}
+        />
+        {formErrors.routeName ? (
+          <Text style={styles.fieldError}>{formErrors.routeName}</Text>
+        ) : null}
+      </View>
+
+      <View style={styles.summaryCard}>
+        <Text style={styles.summaryTitle}>What this means</Text>
+        <Text style={styles.summaryBody}>
+          Route names help you recognize a rule in the route list and history. They do not
+          change which SMS messages are matched.
+        </Text>
+      </View>
+    </View>
+  );
+
+  const renderPermissionsStep = () => (
+    <View style={styles.stepContent}>
+      <Text style={styles.stepTitle}>System Access</Text>
+      <Text style={styles.stepDescription}>
+        AuthRelay reads incoming SMS locally to detect OTPs and forwards them to Telegram.
+        Nothing is sent to a cloud server. These settings keep the listener alive in the
+        background.
+      </Text>
+
+      <View style={styles.permissionCard}>
+        <View style={styles.permissionHeader}>
+          <View style={styles.permissionTextWrap}>
+            <Text style={styles.permissionTitle}>Read SMS</Text>
+            <Text style={styles.permissionSubtitle}>
+              Required to capture incoming OTPs before routing rules can run.
+            </Text>
+          </View>
+          <Switch
+            value={hasSmsPermission}
+            onValueChange={handlePermissionRequest}
+            trackColor={{ false: palette.border, true: palette.success }}
+            thumbColor={palette.panel}
+          />
+        </View>
+
+        <View style={styles.separator} />
+
+        <View style={styles.permissionHeader}>
+          <View style={styles.permissionTextWrap}>
+            <Text style={styles.permissionTitle}>Battery Unrestricted</Text>
+            <Text style={styles.permissionSubtitle}>
+              Prevents Android from killing the listener to save power.
+            </Text>
+          </View>
+          <Switch
+            value={ignoreBatteryOptimizations}
+            onValueChange={handleBatteryToggle}
+            trackColor={{ false: palette.border, true: palette.accent }}
+            thumbColor={palette.panel}
+          />
+        </View>
+
+        <View style={styles.separator} />
+
+        <View style={styles.permissionHeader}>
+          <View style={styles.permissionTextWrap}>
+            <Text style={styles.permissionTitle}>Auto-start (OEM)</Text>
+            <Text style={styles.permissionSubtitle}>
+              Required on Xiaomi, Oppo, Vivo, Huawei and similar devices so SMS receivers
+              fire after a reboot.
+            </Text>
+            {autostartAttempted ? (
+              <Text style={styles.permissionHint}>
+                Settings opened — confirm autostart is enabled there.
+              </Text>
+            ) : null}
+          </View>
+          <Pressable
+            onPress={handleAutostartTrigger}
+            style={({ pressed }) => [
+              styles.autostartButton,
+              pressed && styles.autostartButtonPressed,
+            ]}
+          >
+            <Text style={styles.autostartButtonText}>
+              {autostartAttempted ? 'Reopen' : 'Open'}
+            </Text>
+          </Pressable>
+        </View>
+      </View>
+    </View>
+  );
+
+  const renderTelegramStep = () => (
+    <View style={styles.stepContent}>
+      <Text style={styles.stepTitle}>Telegram Destination</Text>
+      <Text style={styles.stepDescription}>
+        Add the Telegram bot credentials and target chat. The app will generate a display
+        label automatically, so you do not need to enter a separate destination name.
+      </Text>
+
+      <View style={styles.inputWrapper}>
+        <Text style={styles.inputLabel}>Bot Token</Text>
+        <TextInput
+          style={[styles.input, formErrors.telegramBotToken && styles.inputError]}
+          placeholder="123456789:AA..."
+          placeholderTextColor={palette.textMuted}
+          value={routeForm.telegramBotToken}
+          onChangeText={value => updateForm('telegramBotToken', value)}
+          secureTextEntry
+          autoCapitalize="none"
+        />
+        {formErrors.telegramBotToken ? (
+          <Text style={styles.fieldError}>{formErrors.telegramBotToken}</Text>
+        ) : null}
+      </View>
+
+      <View style={styles.inputWrapper}>
+        <Text style={styles.inputLabel}>Chat ID</Text>
+        <TextInput
+          style={[styles.input, formErrors.telegramChatId && styles.inputError]}
+          placeholder="-10012345678 or @channelusername"
+          placeholderTextColor={palette.textMuted}
+          value={routeForm.telegramChatId}
+          onChangeText={value => updateForm('telegramChatId', value)}
+          autoCapitalize="none"
+        />
+        {formErrors.telegramChatId ? (
+          <Text style={styles.fieldError}>{formErrors.telegramChatId}</Text>
+        ) : null}
+      </View>
+
+      <View style={styles.summaryCard}>
+        <Text style={styles.summaryTitle}>Generated destination label</Text>
+        <Text style={styles.summaryValueBlock}>
+          {buildTelegramDestinationName(routeForm.telegramChatId)}
+        </Text>
+      </View>
+    </View>
+  );
+
+  const renderSenderSourceSelector = () => {
+    const options: Array<{
+      value: RouteForm['senderSourceType'];
+      title: string;
+      subtitle: string;
+    }> = [
+      {
+        value: 'any',
+        title: 'Any sender',
+        subtitle: 'Forward every OTP that arrives on this device. Pair with a message filter to narrow it down.',
+      },
+      {
+        value: 'sender_id',
+        title: 'Sender ID or number',
+        subtitle: 'Banks, brand short codes (HDFCBK, AWS) or a single phone number you type in.',
+      },
+      {
+        value: 'contact',
+        title: 'Saved contact',
+        subtitle: 'Pick from your Android contacts. No contacts permission is needed.',
+      },
+    ];
+
+    return (
+      <View style={styles.inputWrapper}>
+        <Text style={styles.inputLabel}>Who should the OTP come from?</Text>
+        <View style={styles.sourceList}>
+          {options.map(option => {
+            const active = routeForm.senderSourceType === option.value;
+            return (
+              <Pressable
+                key={option.value}
+                onPress={() => handleSenderSourceChange(option.value)}
+                style={[styles.sourceOption, active && styles.sourceOptionActive]}
+              >
+                <View style={[styles.sourceRadio, active && styles.sourceRadioActive]}>
+                  {active ? <View style={styles.sourceRadioDot} /> : null}
+                </View>
+                <View style={styles.sourceTextWrap}>
+                  <Text style={styles.sourceOptionTitle}>{option.title}</Text>
+                  <Text style={styles.sourceOptionSubtitle}>{option.subtitle}</Text>
+                </View>
+              </Pressable>
+            );
+          })}
+        </View>
+      </View>
+    );
+  };
+
+  const renderAnySenderHint = () => (
+    <View style={styles.warningCard}>
+      <Text style={styles.warningTitle}>Heads up</Text>
+      <Text style={styles.warningBody}>
+        Any-sender mode forwards every OTP that lands on this device. Add a message filter
+        below if you want to narrow it down (for example, only messages that mention
+        "login" or "verification").
+      </Text>
+    </View>
+  );
+
+  const renderManualSenderFields = () => (
+    <View style={styles.inputWrapper}>
+      <Text style={styles.inputLabel}>Sender ID or Number</Text>
+      <TextInput
+        style={[styles.input, formErrors.senderPattern && styles.inputError]}
+        placeholder="e.g., AWS, HDFCBK, +919876..."
+        placeholderTextColor={palette.textMuted}
+        value={routeForm.senderPattern}
+        onChangeText={value => updateForm('senderPattern', value)}
+        autoCapitalize="characters"
+      />
+      <Text style={styles.inputHint}>
+        Forward OTPs only when the SMS sender contains this text. Use this for bank short
+        codes, app names, or a phone number.
+      </Text>
+      {formErrors.senderPattern ? (
+        <Text style={styles.fieldError}>{formErrors.senderPattern}</Text>
+      ) : null}
+    </View>
+  );
+
+  const renderContactFields = () => {
+    const selected = routeForm.contactDisplayName && routeForm.contactPhoneNumbers[0];
+    return (
+      <View style={styles.contactSection}>
+        {selected ? (
+          <View style={styles.selectedContactCard}>
+            <View style={styles.selectedContactRow}>
+              <View style={styles.contactAvatar}>
+                <Text style={styles.contactAvatarText}>
+                  {routeForm.contactDisplayName.slice(0, 1).toUpperCase()}
+                </Text>
+              </View>
+              <View style={styles.selectedContactTextWrap}>
+                <Text style={styles.selectedContactTitle}>
+                  {routeForm.contactDisplayName}
+                </Text>
+                <Text style={styles.selectedContactMeta}>
+                  {formatPhoneSummary(routeForm.contactPhoneNumbers)}
+                </Text>
+              </View>
+              <Pressable
+                onPress={() => { handlePickContact(); }}
+                disabled={contactPickerBusy}
+                style={({ pressed }) => [
+                  styles.inlineButton,
+                  pressed && styles.inlineButtonPressed,
+                ]}
+              >
+                <Text style={styles.inlineButtonText}>
+                  {contactPickerBusy ? 'Opening…' : 'Change'}
+                </Text>
+              </Pressable>
+            </View>
+          </View>
+        ) : (
+          <Pressable
+            onPress={() => { handlePickContact(); }}
+            disabled={contactPickerBusy}
+            style={({ pressed }) => [
+              styles.pickerButton,
+              pressed && styles.pickerButtonPressed,
+            ]}
+          >
+            <View style={styles.pickerIconCircle}>
+              <Text style={styles.pickerIcon}>+</Text>
+            </View>
+            <View style={styles.pickerTextWrap}>
+              <Text style={styles.pickerTitle}>
+                {contactPickerBusy ? 'Opening contacts…' : 'Pick from Contacts'}
+              </Text>
+              <Text style={styles.pickerSubtitle}>
+                Opens your phone's contact picker. We only read the number you choose.
+              </Text>
+            </View>
+          </Pressable>
+        )}
+
+        {formErrors.contactDisplayName || formErrors.contactPhoneNumbers ? (
+          <Text style={styles.fieldError}>
+            {formErrors.contactDisplayName || formErrors.contactPhoneNumbers}
+          </Text>
+        ) : null}
+      </View>
+    );
+  };
+
+  const renderMessageFilterSection = () => (
+    <View style={styles.messageRulesSection}>
+      <View style={styles.permissionHeader}>
+        <View style={styles.permissionTextWrap}>
+          <Text style={styles.permissionTitle}>Use message text rules</Text>
+          <Text style={styles.permissionSubtitle}>
+            Leave this off to forward any OTP from the matched sender or saved contact.
+          </Text>
+        </View>
+        <Switch
+          value={routeForm.useMessageFilters}
+          onValueChange={value => updateForm('useMessageFilters', value)}
+          trackColor={{ false: palette.border, true: palette.accent }}
+          thumbColor={palette.panel}
+        />
+      </View>
+
+      {!routeForm.useMessageFilters ? null : (
+        <>
+          <View style={styles.segmentRow}>
+            <Pressable
+              onPress={() => updateForm('messageFilterMode', 'include')}
+              style={[
+                styles.segmentButton,
+                routeForm.messageFilterMode === 'include' && styles.segmentButtonActive,
+              ]}
+            >
+              <Text
+                style={[
+                  styles.segmentButtonText,
+                  routeForm.messageFilterMode === 'include' &&
+                    styles.segmentButtonTextActive,
+                ]}
+              >
+                Only send if text contains
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={() => updateForm('messageFilterMode', 'exclude')}
+              style={[
+                styles.segmentButton,
+                routeForm.messageFilterMode === 'exclude' && styles.segmentButtonActive,
+              ]}
+            >
+              <Text
+                style={[
+                  styles.segmentButtonText,
+                  routeForm.messageFilterMode === 'exclude' &&
+                    styles.segmentButtonTextActive,
+                ]}
+              >
+                Block if text contains
+              </Text>
+            </Pressable>
+          </View>
+
+          <Pressable
+            onPress={() => updateForm('messageFilterMode', 'advanced')}
+            style={[
+              styles.advancedModeButton,
+              routeForm.messageFilterMode === 'advanced' && styles.segmentButtonActive,
+            ]}
+          >
+            <Text
+              style={[
+                styles.segmentButtonText,
+                routeForm.messageFilterMode === 'advanced' && styles.segmentButtonTextActive,
+              ]}
+            >
+              Advanced: use both include and exclude
+            </Text>
+          </Pressable>
+
+          {routeForm.messageFilterMode !== 'exclude' ? (
+            <View style={styles.inputWrapper}>
+              <Text style={styles.inputLabel}>Only send if message contains</Text>
+              <TextInput
+                style={[styles.input, formErrors.messageAllowInput && styles.inputError]}
+                placeholder="e.g., login, verification"
+                placeholderTextColor={palette.textMuted}
+                value={routeForm.messageAllowInput}
+                onChangeText={value => updateForm('messageAllowInput', value)}
+              />
+              <Text style={styles.inputHint}>Use commas to add multiple phrases.</Text>
+              {formErrors.messageAllowInput ? (
+                <Text style={styles.fieldError}>{formErrors.messageAllowInput}</Text>
+              ) : null}
+            </View>
+          ) : null}
+
+          {routeForm.messageFilterMode !== 'include' ? (
+            <View style={styles.inputWrapper}>
+              <Text style={styles.inputLabel}>Do not send if message contains</Text>
+              <TextInput
+                style={[styles.input, formErrors.messageBlockInput && styles.inputError]}
+                placeholder="e.g., promo, marketing"
+                placeholderTextColor={palette.textMuted}
+                value={routeForm.messageBlockInput}
+                onChangeText={value => updateForm('messageBlockInput', value)}
+              />
+              <Text style={styles.inputHint}>Blocked phrases take priority over includes.</Text>
+              {formErrors.messageBlockInput ? (
+                <Text style={styles.fieldError}>{formErrors.messageBlockInput}</Text>
+              ) : null}
+            </View>
+          ) : null}
+        </>
+      )}
+    </View>
+  );
+
+  const renderRoutingStep = () => (
+    <View style={styles.stepContent}>
+      <Text style={styles.stepTitle}>Routing Rules</Text>
+      <Text style={styles.stepDescription}>
+        Choose who the OTP should come from, then decide whether message text should be
+        optional extra filtering.
+      </Text>
+
+      {renderSenderSourceSelector()}
+
+      {routeForm.senderSourceType === 'any' ? renderAnySenderHint() : null}
+      {routeForm.senderSourceType === 'sender_id' ? renderManualSenderFields() : null}
+      {routeForm.senderSourceType === 'contact' ? renderContactFields() : null}
+
+      {renderMessageFilterSection()}
+    </View>
+  );
+
+  const renderReviewStep = () => {
+    const hasFilters =
+      routeForm.useMessageFilters &&
+      (parsePhraseList(routeForm.messageAllowInput).length > 0 ||
+        parsePhraseList(routeForm.messageBlockInput).length > 0);
+    const showAnySenderWarning = routeForm.senderSourceType === 'any' && !hasFilters;
+
+    const sourceLabel =
+      routeForm.senderSourceType === 'any'
+        ? 'Any sender on this device'
+        : routeForm.senderSourceType === 'contact'
+          ? routeForm.contactDisplayName || 'Saved contact'
+          : routeForm.senderPattern || 'Sender ID or number';
+
+    return (
+      <View style={styles.stepContent}>
+        <Text style={styles.stepTitle}>Review</Text>
+        <Text style={styles.stepDescription}>
+          Check the route in plain language before saving it. You can go back to adjust any
+          part of the setup.
+        </Text>
+
+        {showAnySenderWarning ? (
+          <View style={styles.warningCard}>
+            <Text style={styles.warningTitle}>This forwards every OTP</Text>
+            <Text style={styles.warningBody}>
+              You picked "Any sender" without a message filter, so every OTP-shaped SMS
+              that arrives on this device will be forwarded. Go back to step 4 to add a
+              filter if you want to narrow it down.
+            </Text>
+          </View>
+        ) : null}
+
+        <View style={styles.summaryCard}>
+          <Text style={styles.summaryTitle}>Plain-language summary</Text>
+          <Text style={styles.summaryNarrative}>{buildRuleNarrative(routeForm)}</Text>
+        </View>
+
+        <View style={styles.summaryCard}>
+          <Text style={styles.summaryTitle}>Route Summary</Text>
+          <View style={styles.summaryRow}>
+            <Text style={styles.summaryLabel}>Route Name</Text>
+            <Text style={styles.summaryValue}>{routeForm.routeName || 'Not set'}</Text>
+          </View>
+          <View style={styles.summaryRow}>
+            <Text style={styles.summaryLabel}>Destination</Text>
+            <Text style={styles.summaryValue}>
+              {buildTelegramDestinationName(routeForm.telegramChatId)}
+            </Text>
+          </View>
+          <View style={styles.summaryRow}>
+            <Text style={styles.summaryLabel}>Source</Text>
+            <Text style={styles.summaryValue}>{sourceLabel}</Text>
+          </View>
+          <View style={styles.summaryRow}>
+            <Text style={styles.summaryLabel}>Message Rules</Text>
+            <Text style={styles.summaryValue}>
+              {routeForm.useMessageFilters
+                ? [
+                    routeForm.messageFilterMode !== 'exclude' &&
+                      parsePhraseList(routeForm.messageAllowInput).length > 0
+                      ? `Include ${parsePhraseList(routeForm.messageAllowInput).join(', ')}`
+                      : null,
+                    routeForm.messageFilterMode !== 'include' &&
+                      parsePhraseList(routeForm.messageBlockInput).length > 0
+                      ? `Exclude ${parsePhraseList(routeForm.messageBlockInput).join(', ')}`
+                      : null,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ') || 'Enabled'
+                : 'Any matched OTP'}
+            </Text>
+          </View>
+        </View>
+      </View>
+    );
   };
 
   const renderWizardStep = () => {
     switch (currentStep) {
       case 0:
-        return (
-          <View style={styles.stepContent}>
-            <Text style={styles.stepTitle}>Team Identifier</Text>
-            <Text style={styles.stepDescription}>
-              Name the team or department this device will forward OTPs to. This helps organize multiple forwarding devices.
-            </Text>
-            <View style={styles.inputWrapper}>
-              <Text style={styles.inputLabel}>Team Name</Text>
-              <TextInput
-                style={[styles.input, formErrors.teamName && styles.inputError]}
-                placeholder="e.g., Engineering, Finance"
-                placeholderTextColor={palette.textMuted}
-                value={receiverForm.teamName}
-                onChangeText={val => updateForm('teamName', val)}
-              />
-              {formErrors.teamName ? (
-                <Text style={styles.fieldError}>{formErrors.teamName}</Text>
-              ) : null}
-            </View>
-          </View>
-        );
+        return renderRouteDetailsStep();
       case 1:
-        return (
-          <View style={styles.stepContent}>
-            <Text style={styles.stepTitle}>System Access</Text>
-            <Text style={styles.stepDescription}>
-              AuthRelay reads incoming SMS locally to detect OTPs and forwards them to your
-              configured destination. Nothing is sent to a cloud server. The settings below
-              keep the listener alive in the background.
-            </Text>
-
-            <View style={styles.permissionCard}>
-              <View style={styles.permissionHeader}>
-                <View style={styles.permissionTextWrap}>
-                  <Text style={styles.permissionTitle}>Read SMS</Text>
-                  <Text style={styles.permissionSubtitle}>
-                    Required to capture OTPs. Only senders that match a route are processed.
-                  </Text>
-                </View>
-                <Switch
-                  value={hasSmsPermission}
-                  onValueChange={handlePermissionRequest}
-                  trackColor={{ false: palette.border, true: palette.success }}
-                  thumbColor={palette.panel}
-                />
-              </View>
-
-              <View style={styles.separator} />
-
-              <View style={styles.permissionHeader}>
-                <View style={styles.permissionTextWrap}>
-                  <Text style={styles.permissionTitle}>Battery Unrestricted</Text>
-                  <Text style={styles.permissionSubtitle}>
-                    Prevents Android from killing the listener to save power.
-                  </Text>
-                </View>
-                <Switch
-                  value={ignoreBatteryOptimizations}
-                  onValueChange={handleBatteryToggle}
-                  trackColor={{ false: palette.border, true: palette.accent }}
-                  thumbColor={palette.panel}
-                />
-              </View>
-
-              <View style={styles.separator} />
-
-              <View style={styles.permissionHeader}>
-                <View style={styles.permissionTextWrap}>
-                  <Text style={styles.permissionTitle}>Auto-start (OEM)</Text>
-                  <Text style={styles.permissionSubtitle}>
-                    Required on Xiaomi, Oppo, Vivo, Huawei and similar devices so SMS
-                    receivers fire after a reboot.
-                  </Text>
-                  {autostartAttempted ? (
-                    <Text style={styles.permissionHint}>
-                      Settings opened — confirm autostart is enabled there.
-                    </Text>
-                  ) : null}
-                </View>
-                <Pressable
-                  onPress={handleAutostartTrigger}
-                  style={({ pressed }) => [
-                    styles.autostartButton,
-                    pressed && styles.autostartButtonPressed,
-                  ]}
-                >
-                  <Text style={styles.autostartButtonText}>
-                    {autostartAttempted ? 'Reopen' : 'Open'}
-                  </Text>
-                </Pressable>
-              </View>
-            </View>
-          </View>
-        );
+        return renderPermissionsStep();
       case 2:
-        return (
-          <View style={styles.stepContent}>
-            <Text style={styles.stepTitle}>Telegram Configuration</Text>
-            <Text style={styles.stepDescription}>
-              Provide the credentials for the Telegram bot that will dispatch the messages.
-            </Text>
-
-            <View style={styles.inputWrapper}>
-              <Text style={styles.inputLabel}>Receiver Name</Text>
-              <TextInput
-                style={[styles.input, formErrors.telegramName && styles.inputError]}
-                placeholder="e.g., Auth Alerts Bot"
-                placeholderTextColor={palette.textMuted}
-                value={receiverForm.telegramName}
-                onChangeText={val => updateForm('telegramName', val)}
-              />
-              {formErrors.telegramName ? (
-                <Text style={styles.fieldError}>{formErrors.telegramName}</Text>
-              ) : null}
-            </View>
-
-            <View style={styles.inputWrapper}>
-              <Text style={styles.inputLabel}>Bot Token</Text>
-              <TextInput
-                style={[styles.input, formErrors.telegramBotToken && styles.inputError]}
-                placeholder="123456789:AA..."
-                placeholderTextColor={palette.textMuted}
-                value={receiverForm.telegramBotToken}
-                onChangeText={val => updateForm('telegramBotToken', val)}
-                secureTextEntry
-                autoCapitalize="none"
-              />
-              {formErrors.telegramBotToken ? (
-                <Text style={styles.fieldError}>{formErrors.telegramBotToken}</Text>
-              ) : null}
-            </View>
-
-            <View style={styles.inputWrapper}>
-              <Text style={styles.inputLabel}>Chat ID</Text>
-              <TextInput
-                style={[styles.input, formErrors.telegramChatId && styles.inputError]}
-                placeholder="-10012345678 or @channelusername"
-                placeholderTextColor={palette.textMuted}
-                value={receiverForm.telegramChatId}
-                onChangeText={val => updateForm('telegramChatId', val)}
-                autoCapitalize="none"
-              />
-              {formErrors.telegramChatId ? (
-                <Text style={styles.fieldError}>{formErrors.telegramChatId}</Text>
-              ) : null}
-            </View>
-          </View>
-        );
+        return renderTelegramStep();
       case 3:
-        return (
-          <View style={styles.stepContent}>
-            <Text style={styles.stepTitle}>Routing Rules</Text>
-            <Text style={styles.stepDescription}>
-              Define which messages should be forwarded based on the sender's ID.
-            </Text>
-
-            <View style={styles.inputWrapper}>
-              <Text style={styles.inputLabel}>Allowed Sender</Text>
-              <TextInput
-                style={[styles.input, formErrors.senderFilter && styles.inputError]}
-                placeholder="e.g., AWS, GITHUB, BANK"
-                placeholderTextColor={palette.textMuted}
-                value={receiverForm.senderFilter}
-                onChangeText={val => updateForm('senderFilter', val)}
-                autoCapitalize="characters"
-              />
-              {formErrors.senderFilter ? (
-                <Text style={styles.fieldError}>{formErrors.senderFilter}</Text>
-              ) : null}
-            </View>
-
-            <View style={styles.summaryCard}>
-              <Text style={styles.summaryTitle}>Route Summary</Text>
-              <View style={styles.summaryRow}>
-                <Text style={styles.summaryLabel}>From</Text>
-                <Text style={styles.summaryValue}>{receiverForm.senderFilter || 'Any'}</Text>
-              </View>
-              <View style={styles.summaryRow}>
-                <Text style={styles.summaryLabel}>To</Text>
-                <Text style={styles.summaryValue}>Telegram ({receiverForm.telegramName || 'Unnamed'})</Text>
-              </View>
-              <View style={styles.summaryRow}>
-                <Text style={styles.summaryLabel}>Owner</Text>
-                <Text style={styles.summaryValue}>{receiverForm.teamName || 'Unknown'}</Text>
-              </View>
-            </View>
-          </View>
-        );
+        return renderRoutingStep();
+      case 4:
+        return renderReviewStep();
       default:
         return null;
     }
@@ -536,7 +996,7 @@ export function HomeScreen() {
         >
           <View style={styles.wizardHeader}>
             <Pressable onPress={goBack} style={styles.backButton}>
-              <Text style={styles.backText}>Cancel</Text>
+              <Text style={styles.backText}>{currentStep === 0 ? 'Cancel' : 'Back'}</Text>
             </Pressable>
             <View style={styles.progressPills}>
               {stepLabels.map((_, idx) => (
@@ -544,7 +1004,7 @@ export function HomeScreen() {
                   key={idx}
                   style={[
                     styles.progressPill,
-                    idx <= currentStep && styles.progressPillActive
+                    idx <= currentStep && styles.progressPillActive,
                   ]}
                 />
               ))}
@@ -559,7 +1019,7 @@ export function HomeScreen() {
           <View style={styles.footer}>
             <Pressable style={styles.primaryButton} onPress={goNext}>
               <Text style={styles.primaryButtonText}>
-                {currentStep === 3 ? 'Complete Setup' : 'Continue'}
+                {currentStep === stepLabels.length - 1 ? 'Complete Setup' : 'Continue'}
               </Text>
             </Pressable>
           </View>
@@ -568,8 +1028,8 @@ export function HomeScreen() {
     );
   }
 
-  // HOME DASHBOARD VIEW
   const listenerDotColor = hasSmsPermission ? palette.success : palette.danger;
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.homeHeader}>
@@ -581,13 +1041,11 @@ export function HomeScreen() {
       </View>
 
       <ScrollView style={styles.scrollArea} contentContainerStyle={styles.homeScrollContent}>
-
         {!hasSmsPermission ? (
           <View style={styles.permissionBanner}>
             <Text style={styles.permissionBannerTitle}>SMS access required</Text>
             <Text style={styles.permissionBannerBody}>
-              The listener can't forward OTPs without permission to read incoming SMS. Only
-              senders that match a route will be processed.
+              The listener cannot forward OTPs without permission to read incoming SMS.
             </Text>
             <Pressable
               style={styles.permissionBannerButton}
@@ -629,7 +1087,6 @@ export function HomeScreen() {
           </View>
         ) : null}
 
-        {/* Latest Event Card */}
         <View style={styles.card}>
           <Text style={styles.cardEyebrow}>LATEST INTERCEPTION</Text>
           {latestEvent ? (
@@ -645,7 +1102,9 @@ export function HomeScreen() {
               <Text style={styles.eventTime}>Source: {latestEvent.source}</Text>
             </View>
           ) : (
-            <Text style={styles.emptyState}>No messages intercepted yet. Background listener is running.</Text>
+            <Text style={styles.emptyState}>
+              No messages intercepted yet. Background listener is running.
+            </Text>
           )}
         </View>
 
@@ -677,20 +1136,22 @@ export function HomeScreen() {
           <View style={styles.routesList}>
             {ruleViews.map(view => {
               const { rule, destination } = view;
-              const destinationLabel = destination
-                ? `Telegram (${destination.name})`
-                : 'Destination missing';
               return (
                 <View key={rule.id} style={styles.routeCard}>
                   <View style={styles.routeCardHeader}>
-                    <Text style={styles.routeCardTitle}>{rule.teamName}</Text>
+                    <Text style={styles.routeCardTitle}>{rule.routeName}</Text>
                     <View
                       style={[
                         styles.activeBadge,
                         !destination && styles.activeBadgeMissing,
                       ]}
                     >
-                      <Text style={styles.activeBadgeText}>
+                      <Text
+                        style={[
+                          styles.activeBadgeText,
+                          !destination && styles.activeBadgeTextDanger,
+                        ]}
+                      >
                         {destination ? 'ACTIVE' : 'BROKEN'}
                       </Text>
                     </View>
@@ -698,12 +1159,18 @@ export function HomeScreen() {
 
                   <View style={styles.routeDetails}>
                     <View style={styles.routeDetailItem}>
-                      <Text style={styles.detailLabel}>Sender</Text>
-                      <Text style={styles.detailValue}>{rule.senderPattern}</Text>
+                      <Text style={styles.detailLabel}>Source</Text>
+                      <Text style={styles.detailValue}>{describeSenderRule(rule)}</Text>
                     </View>
                     <View style={styles.routeDetailItem}>
                       <Text style={styles.detailLabel}>Destination</Text>
-                      <Text style={styles.detailValue}>{destinationLabel}</Text>
+                      <Text style={styles.detailValue}>
+                        {getDestinationDisplayName(destination)}
+                      </Text>
+                    </View>
+                    <View style={styles.routeDetailItem}>
+                      <Text style={styles.detailLabel}>Message Rules</Text>
+                      <Text style={styles.detailValue}>{summarizeFilters(rule)}</Text>
                     </View>
                   </View>
 
@@ -712,7 +1179,7 @@ export function HomeScreen() {
                   <View style={styles.routeActions}>
                     <Pressable
                       style={styles.actionButton}
-                      onPress={() => handleTestRule(view)}
+                      onPress={() => { handleTestRule(view); }}
                       disabled={activeRuleId === rule.id || !destination}
                     >
                       <Text style={styles.actionButtonText}>
@@ -723,7 +1190,7 @@ export function HomeScreen() {
                       style={[styles.actionButton, styles.deleteActionButton]}
                       onPress={() => handleDeleteRule(rule.id)}
                     >
-                      <Text style={styles.actionButtonText}>Delete</Text>
+                      <Text style={styles.deleteActionButtonText}>Delete</Text>
                     </Pressable>
                   </View>
                 </View>
@@ -752,7 +1219,6 @@ const styles = StyleSheet.create({
   homeScrollContent: {
     paddingBottom: 40,
   },
-  // Home Header
   homeHeader: {
     paddingHorizontal: 20,
     paddingVertical: 16,
@@ -782,369 +1248,6 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: palette.textSecondary,
   },
-  // Home Content
-  sectionHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-end',
-    marginTop: 24,
-    marginBottom: 16,
-  },
-  sectionTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: palette.textPrimary,
-  },
-  routeCount: {
-    fontSize: 13,
-    color: palette.textMuted,
-    fontWeight: '600',
-  },
-  card: {
-    backgroundColor: palette.panel,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: palette.border,
-    padding: 20,
-    marginTop: 20,
-  },
-  feedbackBanner: {
-    backgroundColor: palette.accentLight,
-    borderWidth: 1,
-    borderColor: palette.border,
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 20,
-  },
-  feedbackBannerText: {
-    color: palette.textSecondary,
-    fontSize: 13,
-    fontWeight: '600',
-    lineHeight: 18,
-  },
-  cardEyebrow: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: palette.textMuted,
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    marginBottom: 12,
-  },
-  eventBox: {
-    backgroundColor: palette.bg,
-    borderRadius: 12,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: palette.border,
-  },
-  eventSender: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: palette.textPrimary,
-    marginBottom: 4,
-  },
-  eventMessage: {
-    fontSize: 14,
-    color: palette.textSecondary,
-    lineHeight: 20,
-    marginBottom: 8,
-  },
-  eventCode: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: palette.textPrimary,
-    letterSpacing: 1,
-    marginBottom: 8,
-  },
-  eventTime: {
-    fontSize: 12,
-    color: palette.textMuted,
-  },
-  emptyState: {
-    fontSize: 14,
-    color: palette.textMuted,
-    fontStyle: 'italic',
-  },
-  // Empty Routes
-  emptyRoutesContainer: {
-    backgroundColor: palette.panel,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: palette.border,
-    padding: 32,
-    alignItems: 'center',
-  },
-  emptyRouteCircle: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    backgroundColor: palette.bg,
-    borderWidth: 1,
-    borderColor: palette.border,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: 16,
-  },
-  emptyRouteIcon: {
-    fontSize: 32,
-    color: palette.textMuted,
-    fontWeight: '300',
-  },
-  emptyRouteTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: palette.textPrimary,
-    marginBottom: 8,
-  },
-  emptyRouteText: {
-    fontSize: 14,
-    color: palette.textSecondary,
-    textAlign: 'center',
-    marginBottom: 24,
-    lineHeight: 20,
-  },
-  // Routes List
-  routesList: {
-    gap: 16,
-  },
-  routeCard: {
-    backgroundColor: palette.panel,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: palette.border,
-    padding: 20,
-  },
-  routeCardHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  routeCardTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: palette.textPrimary,
-  },
-  activeBadge: {
-    backgroundColor: palette.successLight,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 6,
-  },
-  activeBadgeMissing: {
-    backgroundColor: palette.dangerLight,
-  },
-  activeBadgeText: {
-    color: palette.success,
-    fontSize: 10,
-    fontWeight: '800',
-    letterSpacing: 0.5,
-  },
-  routeDetails: {
-    gap: 12,
-  },
-  routeDetailItem: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-  routeActions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 12,
-  },
-  actionButton: {
-    backgroundColor: palette.accentLight,
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderRadius: 8,
-  },
-  deleteActionButton: {
-    backgroundColor: '#e63946',
-  },
-  actionButtonText: {
-    color: palette.textPrimary,
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  // Wizard Header
-  wizardHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingVertical: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: palette.border,
-    backgroundColor: palette.panel,
-  },
-  backButton: {
-    paddingVertical: 8,
-  },
-  backText: {
-    color: palette.textSecondary,
-    fontSize: 15,
-    fontWeight: '500',
-  },
-  placeholder: {
-    width: 50,
-  },
-  progressPills: {
-    flexDirection: 'row',
-    gap: 6,
-  },
-  progressPill: {
-    width: 24,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: palette.border,
-  },
-  progressPillActive: {
-    backgroundColor: palette.accent,
-  },
-  // Wizard Content
-  stepContent: {
-    paddingVertical: 24,
-  },
-  stepTitle: {
-    fontSize: 24,
-    fontWeight: '700',
-    color: palette.textPrimary,
-    marginBottom: 8,
-    letterSpacing: -0.5,
-  },
-  stepDescription: {
-    fontSize: 15,
-    color: palette.textSecondary,
-    lineHeight: 22,
-    marginBottom: 32,
-  },
-  inputWrapper: {
-    marginBottom: 20,
-  },
-  inputLabel: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: palette.textPrimary,
-    marginBottom: 8,
-    marginLeft: 4,
-  },
-  input: {
-    backgroundColor: palette.inputBg,
-    borderWidth: 1,
-    borderColor: palette.inputBorder,
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    fontSize: 16,
-    color: palette.textPrimary,
-  },
-  // Permissions
-  permissionCard: {
-    backgroundColor: palette.panel,
-    borderWidth: 1,
-    borderColor: palette.border,
-    borderRadius: 16,
-    padding: 16,
-  },
-  permissionHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  permissionTitle: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: palette.textPrimary,
-    marginBottom: 2,
-  },
-  permissionSubtitle: {
-    fontSize: 13,
-    color: palette.textMuted,
-  },
-  separator: {
-    height: 1,
-    backgroundColor: palette.border,
-    marginVertical: 16,
-  },
-  // Summary
-  summaryCard: {
-    backgroundColor: palette.panel,
-    borderWidth: 1,
-    borderColor: palette.border,
-    borderRadius: 12,
-    padding: 16,
-    marginTop: 8,
-  },
-  summaryTitle: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: palette.textMuted,
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    marginBottom: 16,
-  },
-  summaryRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 12,
-  },
-  summaryLabel: {
-    fontSize: 14,
-    color: palette.textSecondary,
-  },
-  summaryValue: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: palette.textPrimary,
-  },
-  // Footer
-  footer: {
-    padding: 20,
-    backgroundColor: palette.bg,
-    borderTopWidth: 1,
-    borderTopColor: palette.border,
-  },
-  primaryButton: {
-    backgroundColor: palette.accent,
-    paddingVertical: 16,
-    paddingHorizontal: 24,
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  primaryButtonText: {
-    color: '#FFFFFF',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  secondaryButton: {
-    backgroundColor: palette.panel,
-    paddingVertical: 16,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: palette.border,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderStyle: 'dashed',
-  },
-  secondaryButtonText: {
-    color: palette.textSecondary,
-    fontSize: 15,
-    fontWeight: '600',
-  },
-  buttonDisabled: {
-    opacity: 0.5,
-  },
-  detailLabel: {
-    fontSize: 14,
-    color: palette.textSecondary,
-  },
-  detailValue: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: palette.textPrimary,
-  },
-  // Permission banner + system-status card
   permissionBanner: {
     marginTop: 20,
     padding: 16,
@@ -1189,29 +1292,429 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     paddingVertical: 4,
+    gap: 12,
   },
   systemStatusLabel: {
     fontSize: 13,
     color: palette.textSecondary,
     fontWeight: '500',
+    flex: 1,
   },
   systemStatusValue: {
     fontSize: 13,
     color: palette.textPrimary,
     fontWeight: '600',
+    flexShrink: 1,
+    textAlign: 'right',
   },
   systemStatusValueWarn: {
     color: palette.danger,
   },
-  // Wizard permissions extras
+  card: {
+    backgroundColor: palette.panel,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: palette.border,
+    padding: 20,
+    marginTop: 20,
+  },
+  cardEyebrow: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: palette.textMuted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 12,
+  },
+  eventBox: {
+    backgroundColor: palette.bg,
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: palette.border,
+  },
+  eventSender: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: palette.textPrimary,
+    marginBottom: 4,
+  },
+  eventMessage: {
+    fontSize: 14,
+    color: palette.textSecondary,
+    lineHeight: 20,
+    marginBottom: 8,
+  },
+  eventCode: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: palette.textPrimary,
+    letterSpacing: 1,
+    marginBottom: 8,
+  },
+  eventTime: {
+    fontSize: 12,
+    color: palette.textMuted,
+  },
+  emptyState: {
+    fontSize: 14,
+    color: palette.textMuted,
+    fontStyle: 'italic',
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-end',
+    marginTop: 24,
+    marginBottom: 16,
+  },
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: palette.textPrimary,
+  },
+  routeCount: {
+    fontSize: 13,
+    color: palette.textMuted,
+    fontWeight: '600',
+  },
+  feedbackBanner: {
+    backgroundColor: palette.accentLight,
+    borderWidth: 1,
+    borderColor: palette.border,
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 20,
+  },
+  feedbackBannerText: {
+    color: palette.textSecondary,
+    fontSize: 13,
+    fontWeight: '600',
+    lineHeight: 18,
+  },
+  emptyRoutesContainer: {
+    backgroundColor: palette.panel,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: palette.border,
+    padding: 32,
+    alignItems: 'center',
+  },
+  emptyRouteCircle: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: palette.bg,
+    borderWidth: 1,
+    borderColor: palette.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 16,
+  },
+  emptyRouteIcon: {
+    fontSize: 32,
+    color: palette.textMuted,
+    fontWeight: '300',
+  },
+  emptyRouteTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: palette.textPrimary,
+    marginBottom: 8,
+  },
+  emptyRouteText: {
+    fontSize: 14,
+    color: palette.textSecondary,
+    textAlign: 'center',
+    marginBottom: 24,
+    lineHeight: 20,
+  },
+  routesList: {
+    gap: 16,
+  },
+  routeCard: {
+    backgroundColor: palette.panel,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: palette.border,
+    padding: 20,
+  },
+  routeCardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+    gap: 12,
+  },
+  routeCardTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: palette.textPrimary,
+    flex: 1,
+  },
+  activeBadge: {
+    backgroundColor: palette.successLight,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  activeBadgeMissing: {
+    backgroundColor: palette.dangerLight,
+  },
+  activeBadgeText: {
+    color: palette.success,
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+  },
+  activeBadgeTextDanger: {
+    color: palette.danger,
+  },
+  routeDetails: {
+    gap: 12,
+  },
+  routeDetailItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 16,
+  },
+  detailLabel: {
+    fontSize: 14,
+    color: palette.textSecondary,
+    flex: 1,
+  },
+  detailValue: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: palette.textPrimary,
+    flex: 1,
+    textAlign: 'right',
+  },
+  routeActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 12,
+  },
+  actionButton: {
+    backgroundColor: palette.accentLight,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+  },
+  actionButtonText: {
+    color: palette.textPrimary,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  deleteActionButton: {
+    backgroundColor: palette.dangerLight,
+    borderWidth: 1,
+    borderColor: palette.danger,
+  },
+  deleteActionButtonText: {
+    color: palette.danger,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  wizardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: palette.border,
+    backgroundColor: palette.panel,
+  },
+  backButton: {
+    paddingVertical: 8,
+  },
+  backText: {
+    color: palette.textSecondary,
+    fontSize: 15,
+    fontWeight: '500',
+  },
+  placeholder: {
+    width: 50,
+  },
+  progressPills: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  progressPill: {
+    width: 24,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: palette.border,
+  },
+  progressPillActive: {
+    backgroundColor: palette.accent,
+  },
+  stepContent: {
+    paddingVertical: 24,
+  },
+  stepTitle: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: palette.textPrimary,
+    marginBottom: 8,
+    letterSpacing: -0.5,
+  },
+  stepDescription: {
+    fontSize: 15,
+    color: palette.textSecondary,
+    lineHeight: 22,
+    marginBottom: 24,
+  },
+  inputWrapper: {
+    marginBottom: 20,
+  },
+  inputLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: palette.textPrimary,
+    marginBottom: 8,
+    marginLeft: 4,
+  },
+  input: {
+    backgroundColor: palette.inputBg,
+    borderWidth: 1,
+    borderColor: palette.inputBorder,
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    fontSize: 16,
+    color: palette.textPrimary,
+  },
+  inputHint: {
+    fontSize: 12,
+    color: palette.textMuted,
+    marginTop: 6,
+    marginLeft: 4,
+    lineHeight: 18,
+  },
+  permissionCard: {
+    backgroundColor: palette.panel,
+    borderWidth: 1,
+    borderColor: palette.border,
+    borderRadius: 16,
+    padding: 16,
+    gap: 12,
+  },
+  permissionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 12,
+  },
   permissionTextWrap: {
     flex: 1,
     paddingRight: 12,
+  },
+  permissionTitle: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: palette.textPrimary,
+    marginBottom: 2,
+  },
+  permissionSubtitle: {
+    fontSize: 13,
+    color: palette.textMuted,
+    lineHeight: 18,
   },
   permissionHint: {
     fontSize: 12,
     color: palette.success,
     marginTop: 4,
+    fontWeight: '600',
+  },
+  separator: {
+    height: 1,
+    backgroundColor: palette.border,
+    marginVertical: 16,
+  },
+  summaryCard: {
+    backgroundColor: palette.panel,
+    borderWidth: 1,
+    borderColor: palette.border,
+    borderRadius: 12,
+    padding: 16,
+    marginTop: 8,
+  },
+  summaryTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: palette.textMuted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 12,
+  },
+  summaryBody: {
+    fontSize: 14,
+    color: palette.textSecondary,
+    lineHeight: 20,
+  },
+  summaryNarrative: {
+    fontSize: 15,
+    color: palette.textPrimary,
+    lineHeight: 22,
+    fontWeight: '500',
+  },
+  summaryValueBlock: {
+    fontSize: 15,
+    color: palette.textPrimary,
+    fontWeight: '600',
+  },
+  summaryRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+    gap: 16,
+  },
+  summaryLabel: {
+    fontSize: 14,
+    color: palette.textSecondary,
+    flex: 1,
+  },
+  summaryValue: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: palette.textPrimary,
+    flex: 1,
+    textAlign: 'right',
+  },
+  footer: {
+    padding: 20,
+    backgroundColor: palette.bg,
+    borderTopWidth: 1,
+    borderTopColor: palette.border,
+  },
+  primaryButton: {
+    backgroundColor: palette.accent,
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  primaryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  secondaryButton: {
+    backgroundColor: palette.panel,
+    paddingVertical: 16,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: palette.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderStyle: 'dashed',
+  },
+  secondaryButtonText: {
+    color: palette.textSecondary,
+    fontSize: 15,
     fontWeight: '600',
   },
   autostartButton: {
@@ -1228,7 +1731,18 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '700',
   },
-  // Form errors
+  inlineButton: {
+    alignSelf: 'flex-start',
+    backgroundColor: palette.accent,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  inlineButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
   inputError: {
     borderColor: palette.danger,
   },
@@ -1238,5 +1752,227 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     marginTop: 6,
     marginLeft: 4,
+  },
+  segmentRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 12,
+  },
+  segmentButton: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: palette.border,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    backgroundColor: palette.panel,
+  },
+  segmentButtonActive: {
+    borderColor: palette.accent,
+    backgroundColor: palette.accentLight,
+  },
+  segmentButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: palette.textSecondary,
+    textAlign: 'center',
+  },
+  segmentButtonTextActive: {
+    color: palette.textPrimary,
+  },
+  advancedModeButton: {
+    borderWidth: 1,
+    borderColor: palette.border,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    backgroundColor: palette.panel,
+    marginBottom: 16,
+  },
+  contactSection: {
+    gap: 16,
+  },
+  selectedContactCard: {
+    backgroundColor: palette.successLight,
+    borderWidth: 1,
+    borderColor: palette.success,
+    borderRadius: 12,
+    padding: 14,
+  },
+  selectedContactTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: palette.textPrimary,
+    marginBottom: 4,
+  },
+  selectedContactMeta: {
+    fontSize: 13,
+    color: palette.textSecondary,
+  },
+  contactList: {
+    gap: 12,
+  },
+  contactCard: {
+    backgroundColor: palette.panel,
+    borderWidth: 1,
+    borderColor: palette.border,
+    borderRadius: 12,
+    padding: 14,
+  },
+  contactCardSelected: {
+    borderColor: palette.accent,
+    backgroundColor: palette.accentLight,
+  },
+  contactName: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: palette.textPrimary,
+    marginBottom: 4,
+  },
+  contactMeta: {
+    fontSize: 13,
+    color: palette.textSecondary,
+  },
+  messageRulesSection: {
+    marginTop: 8,
+    gap: 16,
+  },
+  // Three-option sender source list
+  sourceList: {
+    gap: 10,
+    marginTop: 8,
+  },
+  sourceOption: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    padding: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: palette.border,
+    backgroundColor: palette.panel,
+    gap: 12,
+  },
+  sourceOptionActive: {
+    borderColor: palette.accent,
+    backgroundColor: palette.accentLight,
+  },
+  sourceRadio: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    borderWidth: 2,
+    borderColor: palette.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 2,
+  },
+  sourceRadioActive: {
+    borderColor: palette.accent,
+  },
+  sourceRadioDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: palette.accent,
+  },
+  sourceTextWrap: {
+    flex: 1,
+  },
+  sourceOptionTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: palette.textPrimary,
+    marginBottom: 4,
+  },
+  sourceOptionSubtitle: {
+    fontSize: 13,
+    color: palette.textSecondary,
+    lineHeight: 18,
+  },
+  // System contact picker
+  pickerButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+    padding: 16,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: palette.accent,
+    borderStyle: 'dashed',
+    backgroundColor: palette.panel,
+  },
+  pickerButtonPressed: {
+    opacity: 0.7,
+  },
+  pickerIconCircle: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: palette.accentLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  pickerIcon: {
+    fontSize: 22,
+    fontWeight: '300',
+    color: palette.accent,
+  },
+  pickerTextWrap: {
+    flex: 1,
+  },
+  pickerTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: palette.textPrimary,
+    marginBottom: 2,
+  },
+  pickerSubtitle: {
+    fontSize: 13,
+    color: palette.textSecondary,
+    lineHeight: 18,
+  },
+  selectedContactRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  contactAvatar: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: palette.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  contactAvatarText: {
+    color: '#FFFFFF',
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  selectedContactTextWrap: {
+    flex: 1,
+  },
+  inlineButtonPressed: {
+    opacity: 0.7,
+  },
+  // Any-sender + review warning
+  warningCard: {
+    marginTop: 8,
+    padding: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: palette.danger,
+    backgroundColor: palette.dangerLight,
+  },
+  warningTitle: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: palette.danger,
+    marginBottom: 4,
+  },
+  warningBody: {
+    fontSize: 13,
+    color: palette.textSecondary,
+    lineHeight: 18,
   },
 });

@@ -56,16 +56,14 @@ object SmsDispatcher {
   private fun dispatchInternal(context: Context, sender: String, message: String) {
     val otp = OtpExtractor.extract(message)
 
-    // Gate: nothing in the message looks like an OTP. Don't forward, but log
-    // an "ignored" event so the History screen can show what was filtered.
     if (otp.code == null) {
       logEvent(
-          context,
+          context = context,
           sender = sender,
           status = "ignored",
           maskedCode = null,
           matchedRuleId = null,
-          matchedTeamName = null,
+          matchedRouteName = null,
           destinationName = null,
           reason = "no_otp_detected",
       )
@@ -78,12 +76,12 @@ object SmsDispatcher {
 
     if (rules.isEmpty()) {
       logEvent(
-          context,
+          context = context,
           sender = sender,
           status = "ignored",
           maskedCode = otp.maskedCode,
           matchedRuleId = null,
-          matchedTeamName = null,
+          matchedRouteName = null,
           destinationName = null,
           reason = "no_routes_configured",
       )
@@ -92,23 +90,22 @@ object SmsDispatcher {
     }
 
     val destinationsById = destinations.associateBy { it.id }
-    val normalizedSender = sender.trim().lowercase(Locale.ROOT)
     var matchedAny = false
 
     for (rule in rules) {
-      if (!ruleMatches(rule, normalizedSender)) continue
+      if (!ruleMatches(rule, sender, message)) continue
       matchedAny = true
 
       val destination = destinationsById[rule.destinationId]
       if (destination == null) {
         Log.w(TAG, "Rule ${rule.id} references missing destination ${rule.destinationId}")
         logEvent(
-            context,
+            context = context,
             sender = sender,
             status = "failed",
             maskedCode = otp.maskedCode,
             matchedRuleId = rule.id,
-            matchedTeamName = rule.teamName,
+            matchedRouteName = rule.routeName,
             destinationName = null,
             reason = "destination_missing",
         )
@@ -128,24 +125,24 @@ object SmsDispatcher {
       try {
         adapter.send(payload)
         logEvent(
-            context,
+            context = context,
             sender = sender,
             status = "sent",
             maskedCode = otp.maskedCode,
             matchedRuleId = rule.id,
-            matchedTeamName = rule.teamName,
+            matchedRouteName = rule.routeName,
             destinationName = destination.name,
             reason = null,
         )
       } catch (t: Throwable) {
         Log.e(TAG, "Adapter ${destination.provider::class.simpleName} failed for rule ${rule.id}", t)
         logEvent(
-            context,
+            context = context,
             sender = sender,
             status = "failed",
             maskedCode = otp.maskedCode,
             matchedRuleId = rule.id,
-            matchedTeamName = rule.teamName,
+            matchedRouteName = rule.routeName,
             destinationName = destination.name,
             reason = t.message ?: "delivery_error",
         )
@@ -154,12 +151,12 @@ object SmsDispatcher {
 
     if (!matchedAny) {
       logEvent(
-          context,
+          context = context,
           sender = sender,
           status = "ignored",
           maskedCode = otp.maskedCode,
           matchedRuleId = null,
-          matchedTeamName = null,
+          matchedRouteName = null,
           destinationName = null,
           reason = "no_route_matched",
       )
@@ -167,14 +164,57 @@ object SmsDispatcher {
     }
   }
 
-  private fun ruleMatches(rule: Rule, normalizedSender: String): Boolean {
+  private fun ruleMatches(rule: Rule, sender: String, message: String): Boolean {
     if (!rule.enabled) return false
-    val pattern = rule.senderPattern.trim().lowercase(Locale.ROOT)
-    if (pattern.isEmpty()) return false
-    return when (rule.senderMatchMode) {
-      "contains" -> normalizedSender.contains(pattern)
-      else -> false
+    return doesRuleMatchSender(rule, sender) && doesRuleMatchMessage(rule, message)
+  }
+
+  private fun doesRuleMatchSender(rule: Rule, sender: String): Boolean {
+    return when (rule.senderSourceType) {
+      "any" -> true
+      "contact" -> rule.contactPhoneNumbers.any { phoneNumbersMatch(it, sender) }
+      else -> {
+        val pattern = rule.senderPattern.trim().lowercase(Locale.ROOT)
+        if (pattern.isEmpty()) return false
+        sender.trim().lowercase(Locale.ROOT).contains(pattern)
+      }
     }
+  }
+
+  private fun doesRuleMatchMessage(rule: Rule, message: String): Boolean {
+    val normalizedMessage = message.trim().lowercase(Locale.ROOT)
+    if (normalizedMessage.isEmpty()) return false
+
+    if (rule.messageAllowPatterns.isNotEmpty()) {
+      val hasAllowMatch =
+          rule.messageAllowPatterns.any { pattern ->
+            normalizedMessage.contains(pattern.trim().lowercase(Locale.ROOT))
+          }
+      if (!hasAllowMatch) return false
+    }
+
+    val hasBlockedPattern =
+        rule.messageBlockPatterns.any { pattern ->
+          normalizedMessage.contains(pattern.trim().lowercase(Locale.ROOT))
+        }
+    if (hasBlockedPattern) return false
+
+    return true
+  }
+
+  private fun phoneNumbersMatch(left: String, right: String): Boolean {
+    val normalizedLeft = normalizePhoneNumber(left)
+    val normalizedRight = normalizePhoneNumber(right)
+    if (normalizedLeft.isEmpty() || normalizedRight.isEmpty()) return false
+    if (normalizedLeft == normalizedRight) return true
+
+    val shorter = if (normalizedLeft.length <= normalizedRight.length) normalizedLeft else normalizedRight
+    val longer = if (normalizedLeft.length > normalizedRight.length) normalizedLeft else normalizedRight
+    return shorter.length >= 7 && longer.endsWith(shorter)
+  }
+
+  private fun normalizePhoneNumber(value: String): String {
+    return value.filter { it.isDigit() }
   }
 
   // ───────────────────────────────────────────────────────────
@@ -198,7 +238,6 @@ object SmsDispatcher {
       val obj = array.optJSONObject(i) ?: continue
       val id = obj.optString("id")
       if (id.isEmpty()) continue
-      val name = obj.optString("name")
       val providerObj = obj.optJSONObject("provider") ?: continue
       val provider =
           when (providerObj.optString("type")) {
@@ -210,9 +249,26 @@ object SmsDispatcher {
             }
             else -> continue
           }
+      val rawName = obj.optString("name")
+      val name =
+          if (rawName.isNotEmpty()) {
+            rawName
+          } else {
+            when (provider) {
+              is DestinationProvider.Telegram -> buildTelegramDestinationName(provider.chatId)
+            }
+          }
       out.add(Destination(id = id, name = name, provider = provider))
     }
     return out
+  }
+
+  private fun buildTelegramDestinationName(chatId: String): String {
+    val trimmed = chatId.trim()
+    if (trimmed.isEmpty()) return "Telegram destination"
+    if (trimmed.startsWith("@")) return "Telegram $trimmed"
+    val suffix = if (trimmed.length > 6) trimmed.takeLast(6) else trimmed
+    return "Telegram chat $suffix"
   }
 
   private fun loadRules(context: Context): List<Rule> {
@@ -234,16 +290,33 @@ object SmsDispatcher {
       if (id.isEmpty()) continue
       val destinationId = obj.optString("destinationId")
       if (destinationId.isEmpty()) continue
+      val contactPhones = jsonArrayToStringList(obj.optJSONArray("contactPhoneNumbers"))
+      val allowPatterns = jsonArrayToStringList(obj.optJSONArray("messageAllowPatterns"))
+      val blockPatterns = jsonArrayToStringList(obj.optJSONArray("messageBlockPatterns"))
       out.add(
           Rule(
               id = id,
               enabled = obj.optBoolean("enabled", true),
-              teamName = obj.optString("teamName"),
+              routeName = obj.optString("routeName").ifEmpty { obj.optString("teamName", "Route") },
+              senderSourceType = obj.optString("senderSourceType", "sender_id"),
               senderPattern = obj.optString("senderPattern"),
-              senderMatchMode = obj.optString("senderMatchMode", "contains"),
+              contactDisplayName = obj.optString("contactDisplayName").ifEmpty { null },
+              contactPhoneNumbers = contactPhones,
+              messageAllowPatterns = allowPatterns,
+              messageBlockPatterns = blockPatterns,
               destinationId = destinationId,
           ),
       )
+    }
+    return out
+  }
+
+  private fun jsonArrayToStringList(array: JSONArray?): List<String> {
+    if (array == null) return emptyList()
+    val out = mutableListOf<String>()
+    for (i in 0 until array.length()) {
+      val value = array.optString(i).trim()
+      if (value.isNotEmpty()) out.add(value)
     }
     return out
   }
@@ -258,7 +331,7 @@ object SmsDispatcher {
       status: String,
       maskedCode: String?,
       matchedRuleId: String?,
-      matchedTeamName: String?,
+      matchedRouteName: String?,
       destinationName: String?,
       reason: String?,
   ) {
@@ -270,7 +343,7 @@ object SmsDispatcher {
           put("status", status)
           if (maskedCode != null) put("maskedCode", maskedCode) else put("maskedCode", JSONObject.NULL)
           if (matchedRuleId != null) put("matchedRuleId", matchedRuleId)
-          if (matchedTeamName != null) put("matchedTeamName", matchedTeamName)
+          if (matchedRouteName != null) put("matchedRouteName", matchedRouteName)
           if (destinationName != null) put("destinationName", destinationName)
           if (reason != null) put("reason", reason)
         }

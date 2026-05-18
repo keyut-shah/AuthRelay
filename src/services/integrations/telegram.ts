@@ -1,4 +1,5 @@
 import type { DestinationConfig } from '../../types';
+import { describeSenderRule } from '../routing';
 import type { DeliveryPayload, IntegrationAdapter } from './types';
 
 const TELEGRAM_API_BASE = 'https://api.telegram.org';
@@ -15,20 +16,21 @@ function ensureTelegram(destination: DestinationConfig) {
   return destination.provider;
 }
 
-function buildOtpText(payload: DeliveryPayload): string {
+function buildOtpText(payload: DeliveryPayload) {
   const { rule, destination, sender, rawMessage } = payload;
   return [
-    `AuthRelay OTP for ${rule.teamName}`,
+    `AuthRelay OTP for ${rule.routeName}`,
     '',
     `Sender: ${sender}`,
-    `Route filter: ${rule.senderPattern}`,
+    `Route: ${rule.routeName}`,
+    `Sender rule: ${describeSenderRule(rule)}`,
     `Destination: ${destination.name}`,
     '',
     rawMessage,
   ].join('\n');
 }
 
-function buildTestText(destination: DestinationConfig): string {
+function buildTestText(destination: DestinationConfig) {
   return [
     `AuthRelay test message`,
     '',

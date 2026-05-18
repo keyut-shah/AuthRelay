@@ -20,9 +20,13 @@ data class Destination(
 data class Rule(
     val id: String,
     val enabled: Boolean,
-    val teamName: String,
+    val routeName: String,
+    val senderSourceType: String,
     val senderPattern: String,
-    val senderMatchMode: String,
+    val contactDisplayName: String?,
+    val contactPhoneNumbers: List<String>,
+    val messageAllowPatterns: List<String>,
+    val messageBlockPatterns: List<String>,
     val destinationId: String,
 )
 

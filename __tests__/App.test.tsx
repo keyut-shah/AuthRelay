@@ -33,6 +33,7 @@ jest.mock('react-native-mmkv', () => {
   isIgnoringBatteryOptimizations: jest.fn().mockResolvedValue(false),
   requestIgnoreBatteryOptimizations: jest.fn().mockResolvedValue(false),
   openAutostartSettings: jest.fn().mockResolvedValue(false),
+  pickContact: jest.fn().mockResolvedValue(null),
   simulateIncomingSms: jest.fn(),
   addListener: jest.fn(),
   removeListeners: jest.fn(),

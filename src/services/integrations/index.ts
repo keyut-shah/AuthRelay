@@ -1,4 +1,8 @@
 import type { DestinationConfig, DestinationType, RouteRule } from '../../types';
+import {
+  doesRouteMatchMessage as doesRouteMatchMessageValue,
+  doesRouteMatchSender as doesRouteMatchSenderValue,
+} from '../routing';
 import { telegramAdapter } from './telegram';
 import type { DeliveryPayload, IntegrationAdapter } from './types';
 
@@ -12,21 +16,12 @@ export function getAdapter(type: DestinationType): IntegrationAdapter {
   return adapter;
 }
 
-/**
- * Match a rule against an incoming sender. Whitelist-only: empty/missing
- * patterns never match.
- */
 export function doesRuleMatchSender(rule: RouteRule, sender: string): boolean {
-  if (!rule.enabled) return false;
-  const pattern = rule.senderPattern.trim().toLowerCase();
-  if (pattern.length === 0) return false;
-  const normalizedSender = sender.trim().toLowerCase();
-  switch (rule.senderMatchMode) {
-    case 'contains':
-      return normalizedSender.includes(pattern);
-    default:
-      return false;
-  }
+  return doesRouteMatchSenderValue(rule, sender);
+}
+
+export function doesRuleMatchMessage(rule: RouteRule, message: string): boolean {
+  return doesRouteMatchMessageValue(rule, message);
 }
 
 export type SendOutcome = { status: 'sent' } | { status: 'failed'; error: Error };

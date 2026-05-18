@@ -1,7 +1,7 @@
 import { NativeModules } from 'react-native';
 import { createMMKV, type MMKV } from 'react-native-mmkv';
 import type { z } from 'zod';
-import { EVENT_HISTORY_CAP, StorageKeys } from './keys';
+import { buildTelegramDestinationName } from '../services/destinations';
 import type {
   DestinationConfig,
   ProcessedMessageEvent,
@@ -13,6 +13,7 @@ import {
   RouteRuleSchema,
   safeParseArray,
 } from '../schemas';
+import { EVENT_HISTORY_CAP, StorageKeys } from './keys';
 
 export const STORAGE_ID = 'msg-forwarder-storage';
 
@@ -20,8 +21,20 @@ type SmsRouterNativeModule = {
   getEncryptionKey(): Promise<string>;
 };
 
+type LegacyStoredRoute = {
+  id?: string;
+  teamName?: string;
+  telegramName?: string;
+  telegramBotToken?: string;
+  telegramChatId?: string;
+  senderFilter?: string;
+};
+
 let storage: MMKV | null = null;
 let initPromise: Promise<void> | null = null;
+
+const newId = (prefix: string) =>
+  `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
 export function initStorage(): Promise<void> {
   if (storage) return Promise.resolve();
@@ -48,76 +61,119 @@ function requireStorage(): MMKV {
   return storage;
 }
 
-const newId = (prefix: string) =>
-  `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+export function migrateLegacyRoutes(raw: unknown): {
+  destinations: DestinationConfig[];
+  rules: RouteRule[];
+} {
+  const parsed = Array.isArray(raw) ? (raw as LegacyStoredRoute[]) : [];
+  const destinations: DestinationConfig[] = [];
+  const rules: RouteRule[] = [];
 
-// ───────────────────────────────────────────────────────────
-// Migration: legacy `app_routes` → split into destinations + rules
-// ───────────────────────────────────────────────────────────
+  for (const legacy of parsed) {
+    if (
+      !legacy ||
+      !legacy.telegramBotToken ||
+      !legacy.telegramChatId ||
+      !legacy.senderFilter
+    ) {
+      continue;
+    }
 
-type LegacyStoredRoute = {
-  id?: string;
-  teamName?: string;
-  telegramName?: string;
-  telegramBotToken?: string;
-  telegramChatId?: string;
-  senderFilter?: string;
-};
+    const destinationId = newId('dest');
+    const destinationName =
+      legacy.telegramName?.trim() || buildTelegramDestinationName(legacy.telegramChatId);
+
+    destinations.push({
+      id: destinationId,
+      name: destinationName,
+      provider: {
+        type: 'telegram',
+        botToken: legacy.telegramBotToken,
+        chatId: legacy.telegramChatId,
+      },
+    });
+
+    rules.push({
+      id: legacy.id || newId('rule'),
+      enabled: true,
+      routeName: legacy.teamName?.trim() || 'Route',
+      senderSourceType: 'sender_id',
+      senderPattern: legacy.senderFilter.trim(),
+      contactDisplayName: null,
+      contactPhoneNumbers: [],
+      messageAllowPatterns: [],
+      messageBlockPatterns: [],
+      destinationId,
+    });
+  }
+
+  return { destinations, rules };
+}
+
+export function normalizeStoredRules(raw: unknown): RouteRule[] {
+  return safeParseArray(RouteRuleSchema, raw, 'rule');
+}
+
+export function normalizeStoredEvents(raw: unknown): ProcessedMessageEvent[] {
+  return safeParseArray(ProcessedMessageEventSchema, raw, 'event');
+}
+
+function normalizeStoredDestinations(raw: unknown): DestinationConfig[] {
+  return safeParseArray(DestinationConfigSchema, raw, 'destination').map(destination => {
+    if (destination.name.trim()) return destination;
+    if (destination.provider.type === 'telegram') {
+      return {
+        ...destination,
+        name: buildTelegramDestinationName(destination.provider.chatId),
+      };
+    }
+    return destination;
+  });
+}
+
+function rewriteNormalizedCollection<T>(
+  mmkv: MMKV,
+  key: string,
+  normalizer: (raw: unknown) => T[],
+) {
+  const raw = mmkv.getString(key);
+  if (!raw) return;
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const normalized = normalizer(parsed);
+    mmkv.set(key, JSON.stringify(normalized));
+  } catch (e) {
+    console.error(`[storage] Failed to normalize ${key}`, e);
+  }
+}
 
 function runMigrations(mmkv: MMKV) {
   const legacyRaw = mmkv.getString(StorageKeys.ROUTES_LEGACY);
-  if (!legacyRaw) return;
+  if (legacyRaw) {
+    const hasNewDestinations = !!mmkv.getString(StorageKeys.DESTINATIONS);
+    const hasNewRules = !!mmkv.getString(StorageKeys.RULES);
 
-  const hasNewDestinations = !!mmkv.getString(StorageKeys.DESTINATIONS);
-  const hasNewRules = !!mmkv.getString(StorageKeys.RULES);
-
-  // If new keys are already populated, just drop the legacy blob.
-  if (hasNewDestinations || hasNewRules) {
-    mmkv.remove(StorageKeys.ROUTES_LEGACY);
-    return;
-  }
-
-  try {
-    const parsed = JSON.parse(legacyRaw) as LegacyStoredRoute[];
-    const destinations: DestinationConfig[] = [];
-    const rules: RouteRule[] = [];
-
-    for (const legacy of parsed) {
-      if (
-        !legacy ||
-        !legacy.telegramBotToken ||
-        !legacy.telegramChatId ||
-        !legacy.senderFilter
-      ) {
-        continue;
+    if (!hasNewDestinations && !hasNewRules) {
+      try {
+        const parsed = JSON.parse(legacyRaw) as unknown;
+        const migrated = migrateLegacyRoutes(parsed);
+        mmkv.set(StorageKeys.DESTINATIONS, JSON.stringify(migrated.destinations));
+        mmkv.set(StorageKeys.RULES, JSON.stringify(migrated.rules));
+        console.info(
+          `[storage] Migrated ${migrated.rules.length} legacy route(s) to destinations + rules.`,
+        );
+      } catch (e) {
+        console.error('[storage] Failed to migrate legacy routes', e);
       }
-      const destinationId = newId('dest');
-      destinations.push({
-        id: destinationId,
-        name: legacy.telegramName || 'Telegram',
-        provider: {
-          type: 'telegram',
-          botToken: legacy.telegramBotToken,
-          chatId: legacy.telegramChatId,
-        },
-      });
-      rules.push({
-        id: legacy.id || newId('rule'),
-        enabled: true,
-        teamName: legacy.teamName || 'Ops',
-        senderPattern: legacy.senderFilter.trim(),
-        senderMatchMode: 'contains',
-        destinationId,
-      });
     }
 
-    mmkv.set(StorageKeys.DESTINATIONS, JSON.stringify(destinations));
-    mmkv.set(StorageKeys.RULES, JSON.stringify(rules));
     mmkv.remove(StorageKeys.ROUTES_LEGACY);
-    console.info(`[storage] Migrated ${rules.length} legacy route(s) to destinations + rules.`);
-  } catch (e) {
-    console.error('[storage] Failed to migrate legacy routes', e);
   }
+
+  rewriteNormalizedCollection(mmkv, StorageKeys.DESTINATIONS, normalizeStoredDestinations);
+  rewriteNormalizedCollection(mmkv, StorageKeys.RULES, normalizeStoredRules);
+  rewriteNormalizedCollection(mmkv, StorageKeys.EVENTS, normalizeStoredEvents);
 }
 
 // ───────────────────────────────────────────────────────────
@@ -139,7 +195,18 @@ function readJsonArray<T>(key: string, schema: z.ZodType<T>, label: string): T[]
 export const StorageHelpers = {
   // — Destinations —
   getDestinations: (): DestinationConfig[] =>
-    readJsonArray(StorageKeys.DESTINATIONS, DestinationConfigSchema, 'destination'),
+    readJsonArray(StorageKeys.DESTINATIONS, DestinationConfigSchema, 'destination').map(
+      destination => {
+        if (destination.name.trim()) return destination;
+        if (destination.provider.type === 'telegram') {
+          return {
+            ...destination,
+            name: buildTelegramDestinationName(destination.provider.chatId),
+          };
+        }
+        return destination;
+      },
+    ),
 
   saveDestinations: (destinations: DestinationConfig[]) => {
     requireStorage().set(StorageKeys.DESTINATIONS, JSON.stringify(destinations));

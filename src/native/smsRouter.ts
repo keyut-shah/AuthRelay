@@ -4,6 +4,7 @@ import {
   PermissionsAndroid,
   Platform,
 } from 'react-native';
+import type { PickedContact } from '../types';
 
 export type ListenerStatus = {
   receiverRegistered: boolean;
@@ -29,6 +30,7 @@ type SmsRouterNativeModule = {
   isIgnoringBatteryOptimizations(): Promise<boolean>;
   requestIgnoreBatteryOptimizations(): Promise<boolean>;
   openAutostartSettings(): Promise<boolean>;
+  pickContact(): Promise<PickedContact | null>;
 };
 
 const { SmsRouterModule } = NativeModules as {
@@ -80,6 +82,17 @@ export async function requestIgnoreBatteryOptimizations(): Promise<boolean> {
 export async function openAutostartSettings(): Promise<boolean> {
   if (!SmsRouterModule) return false;
   return SmsRouterModule.openAutostartSettings();
+}
+
+/**
+ * Opens Android's native system contact picker. Resolves to the chosen
+ * contact's display name + a single phone number, or `null` when the user
+ * cancels. No READ_CONTACTS permission is requested — the system grants
+ * temporary read access to just the picked phone row.
+ */
+export async function pickContact(): Promise<PickedContact | null> {
+  if (!SmsRouterModule) return null;
+  return SmsRouterModule.pickContact();
 }
 
 export function simulateIncomingSms(sender: string, message: string) {

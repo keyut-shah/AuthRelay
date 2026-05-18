@@ -2,6 +2,7 @@ package com.msgforwarderapp.sms.integrations
 
 import android.util.Log
 import java.io.IOException
+import java.util.Locale
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -27,23 +28,35 @@ class TelegramAdapter(
   }
 
   private fun buildOtpText(payload: DeliveryPayload): String {
-    val team = payload.rule.teamName.ifEmpty { "Ops" }
+    val routeName = payload.rule.routeName.ifEmpty { "Route" }
     return buildString {
       append("AuthRelay OTP for ")
-      append(team)
+      append(routeName)
       append('\n')
       append('\n')
       append("Sender: ")
       append(payload.sender)
       append('\n')
-      append("Route filter: ")
-      append(payload.rule.senderPattern)
+      append("Route: ")
+      append(routeName)
+      append('\n')
+      append("Sender rule: ")
+      append(describeSenderRule(payload.rule))
       append('\n')
       append("Destination: ")
       append(payload.destination.name)
       append('\n')
       append('\n')
       append(payload.rawMessage)
+    }
+  }
+
+  private fun describeSenderRule(rule: Rule): String {
+    return if (rule.senderSourceType == "contact") {
+      val contactName = rule.contactDisplayName?.ifEmpty { "Saved contact" } ?: "Saved contact"
+      "$contactName (${rule.contactPhoneNumbers.size} number${if (rule.contactPhoneNumbers.size == 1) "" else "s"})"
+    } else {
+      rule.senderPattern.ifEmpty { "Unknown sender" }
     }
   }
 

@@ -1,5 +1,5 @@
 // ───────────────────────────────────────────────────────────
-// Destinations — "who/where messages get delivered to"
+// Destinations — "where messages get delivered to"
 // ───────────────────────────────────────────────────────────
 
 export type DestinationType = 'telegram'; // 'slack' | 'discord' come later
@@ -15,7 +15,7 @@ export type DestinationProvider = TelegramDestinationConfig;
 
 export type DestinationConfig = {
   id: string;
-  name: string; // human label, e.g. "Auth Alerts Bot"
+  name: string;
   provider: DestinationProvider;
 };
 
@@ -23,28 +23,49 @@ export type DestinationConfig = {
 // Route rules — "what should be forwarded, and to which destination"
 // ───────────────────────────────────────────────────────────
 
-export type SenderMatchMode = 'contains'; // 'exact' | 'regex' come later
+export type SenderSourceType = 'any' | 'sender_id' | 'contact';
+export type MessageFilterMode = 'include' | 'exclude' | 'advanced';
 
 export type RouteRule = {
   id: string;
   enabled: boolean;
-  teamName: string;
+  routeName: string;
+  senderSourceType: SenderSourceType;
   senderPattern: string;
-  senderMatchMode: SenderMatchMode;
+  contactDisplayName: string | null;
+  contactPhoneNumbers: string[];
+  messageAllowPatterns: string[];
+  messageBlockPatterns: string[];
   destinationId: string;
 };
 
 // ───────────────────────────────────────────────────────────
-// UI form shape for the create-route wizard (collects rule + destination
-// fields in a single flow). Split into a RouteRule + DestinationConfig on save.
+// UI form shape for the create-route wizard
 // ───────────────────────────────────────────────────────────
 
-export type ReceiverForm = {
-  teamName: string;
-  telegramName: string;
+export type RouteForm = {
+  routeName: string;
   telegramBotToken: string;
   telegramChatId: string;
-  senderFilter: string;
+  senderSourceType: SenderSourceType;
+  senderPattern: string;
+  contactDisplayName: string;
+  contactPhoneNumbers: string[];
+  useMessageFilters: boolean;
+  messageFilterMode: MessageFilterMode;
+  messageAllowInput: string;
+  messageBlockInput: string;
+};
+
+/**
+ * Result returned by the native system-contact picker. We use Android's
+ * ACTION_PICK so the user sees their familiar contacts app — no
+ * READ_CONTACTS permission is required, and the system grants temporary
+ * read access to the single picked phone row.
+ */
+export type PickedContact = {
+  displayName: string;
+  phoneNumber: string;
 };
 
 // ───────────────────────────────────────────────────────────
@@ -65,7 +86,7 @@ export type ProcessedMessageEvent = {
   createdAt: number;
   sender: string;
   matchedRuleId?: string;
-  matchedTeamName?: string;
+  matchedRouteName?: string;
   destinationName?: string;
   status: ProcessedEventStatus;
   /** Last 2 digits of the OTP, the rest masked. Null when no code was detected. */

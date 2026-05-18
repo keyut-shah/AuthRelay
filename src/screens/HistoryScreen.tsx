@@ -17,7 +17,7 @@ import { StorageHelpers } from '../storage';
 import { palette } from '../theme';
 import type { ProcessedEventStatus, ProcessedMessageEvent } from '../types';
 
-const ALL_TEAMS = '__all__';
+const ALL_ROUTES = '__all__';
 
 const STATUS_LABEL: Record<ProcessedEventStatus, string> = {
   sent: 'SENT',
@@ -34,7 +34,7 @@ const STATUS_TONE: Record<ProcessedEventStatus, { bg: string; fg: string }> = {
 const REASON_LABEL: Record<string, string> = {
   no_otp_detected: 'No OTP code in message',
   no_routes_configured: 'No routes configured',
-  no_route_matched: 'No route matched sender',
+  no_route_matched: 'No route matched sender or message rules',
   missing_credentials: 'Route missing bot token or chat ID',
   network_error: 'Network error',
 };
@@ -58,7 +58,7 @@ function formatExactTime(ms: number): string {
 
 export function HistoryScreen() {
   const [events, setEvents] = useState<ProcessedMessageEvent[]>([]);
-  const [teamFilter, setTeamFilter] = useState<string>(ALL_TEAMS);
+  const [routeFilter, setRouteFilter] = useState<string>(ALL_ROUTES);
   const [refreshing, setRefreshing] = useState(false);
 
   const reload = useCallback(() => {
@@ -83,18 +83,18 @@ export function HistoryScreen() {
     };
   }, [reload]);
 
-  const teams = useMemo(() => {
+  const routeNames = useMemo(() => {
     const set = new Set<string>();
     for (const event of events) {
-      if (event.matchedTeamName) set.add(event.matchedTeamName);
+      if (event.matchedRouteName) set.add(event.matchedRouteName);
     }
     return Array.from(set).sort();
   }, [events]);
 
   const filteredEvents = useMemo(() => {
-    if (teamFilter === ALL_TEAMS) return events;
-    return events.filter(event => event.matchedTeamName === teamFilter);
-  }, [events, teamFilter]);
+    if (routeFilter === ALL_ROUTES) return events;
+    return events.filter(event => event.matchedRouteName === routeFilter);
+  }, [events, routeFilter]);
 
   const handleRefresh = () => {
     setRefreshing(true);
@@ -140,11 +140,11 @@ export function HistoryScreen() {
           </Text>
         </View>
 
-        {item.matchedTeamName ? (
+        {item.matchedRouteName ? (
           <View style={styles.eventBodyRow}>
-            <Text style={styles.eventLabel}>Team</Text>
+            <Text style={styles.eventLabel}>Route</Text>
             <Text style={styles.eventValue} numberOfLines={1}>
-              {item.matchedTeamName}
+              {item.matchedRouteName}
             </Text>
           </View>
         ) : null}
@@ -198,23 +198,23 @@ export function HistoryScreen() {
         </Text>
       </View>
 
-      {teams.length > 0 ? (
+      {routeNames.length > 0 ? (
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={styles.filterStrip}
         >
           <FilterChip
-            label="All teams"
-            active={teamFilter === ALL_TEAMS}
-            onPress={() => setTeamFilter(ALL_TEAMS)}
+            label="All routes"
+            active={routeFilter === ALL_ROUTES}
+            onPress={() => setRouteFilter(ALL_ROUTES)}
           />
-          {teams.map(team => (
+          {routeNames.map(routeName => (
             <FilterChip
-              key={team}
-              label={team}
-              active={teamFilter === team}
-              onPress={() => setTeamFilter(team)}
+              key={routeName}
+              label={routeName}
+              active={routeFilter === routeName}
+              onPress={() => setRouteFilter(routeName)}
             />
           ))}
         </ScrollView>
