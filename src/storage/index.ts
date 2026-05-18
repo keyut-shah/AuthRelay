@@ -1,11 +1,18 @@
 import { NativeModules } from 'react-native';
 import { createMMKV, type MMKV } from 'react-native-mmkv';
+import type { z } from 'zod';
 import { EVENT_HISTORY_CAP, StorageKeys } from './keys';
 import type {
   DestinationConfig,
   ProcessedMessageEvent,
   RouteRule,
 } from '../types';
+import {
+  DestinationConfigSchema,
+  ProcessedMessageEventSchema,
+  RouteRuleSchema,
+  safeParseArray,
+} from '../schemas';
 
 export const STORAGE_ID = 'msg-forwarder-storage';
 
@@ -114,57 +121,15 @@ function runMigrations(mmkv: MMKV) {
 }
 
 // ───────────────────────────────────────────────────────────
-// Validation
+// Helpers — parse with zod, silently drop malformed rows.
 // ───────────────────────────────────────────────────────────
 
-function isDestinationConfig(value: unknown): value is DestinationConfig {
-  if (!value || typeof value !== 'object') return false;
-  const v = value as Record<string, unknown>;
-  if (typeof v.id !== 'string' || typeof v.name !== 'string') return false;
-  const provider = v.provider as Record<string, unknown> | undefined;
-  if (!provider) return false;
-  if (provider.type === 'telegram') {
-    return typeof provider.botToken === 'string' && typeof provider.chatId === 'string';
-  }
-  return false;
-}
-
-function isRouteRule(value: unknown): value is RouteRule {
-  if (!value || typeof value !== 'object') return false;
-  const v = value as Record<string, unknown>;
-  return (
-    typeof v.id === 'string' &&
-    typeof v.enabled === 'boolean' &&
-    typeof v.teamName === 'string' &&
-    typeof v.senderPattern === 'string' &&
-    v.senderMatchMode === 'contains' &&
-    typeof v.destinationId === 'string'
-  );
-}
-
-function isProcessedMessageEvent(value: unknown): value is ProcessedMessageEvent {
-  if (!value || typeof value !== 'object') return false;
-  const v = value as Record<string, unknown>;
-  return (
-    typeof v.id === 'string' &&
-    typeof v.createdAt === 'number' &&
-    typeof v.sender === 'string' &&
-    (v.status === 'sent' || v.status === 'failed' || v.status === 'ignored') &&
-    (v.maskedCode === null || typeof v.maskedCode === 'string')
-  );
-}
-
-// ───────────────────────────────────────────────────────────
-// Helpers
-// ───────────────────────────────────────────────────────────
-
-function readJsonArray<T>(key: string, guard: (value: unknown) => value is T): T[] {
+function readJsonArray<T>(key: string, schema: z.ZodType<T>, label: string): T[] {
   const raw = requireStorage().getString(key);
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(guard);
+    return safeParseArray(schema, parsed, label);
   } catch (e) {
     console.error(`Failed to parse ${key} from MMKV`, e);
     return [];
@@ -174,7 +139,7 @@ function readJsonArray<T>(key: string, guard: (value: unknown) => value is T): T
 export const StorageHelpers = {
   // — Destinations —
   getDestinations: (): DestinationConfig[] =>
-    readJsonArray(StorageKeys.DESTINATIONS, isDestinationConfig),
+    readJsonArray(StorageKeys.DESTINATIONS, DestinationConfigSchema, 'destination'),
 
   saveDestinations: (destinations: DestinationConfig[]) => {
     requireStorage().set(StorageKeys.DESTINATIONS, JSON.stringify(destinations));
@@ -206,7 +171,7 @@ export const StorageHelpers = {
   newDestinationId: () => newId('dest'),
 
   // — Rules —
-  getRules: (): RouteRule[] => readJsonArray(StorageKeys.RULES, isRouteRule),
+  getRules: (): RouteRule[] => readJsonArray(StorageKeys.RULES, RouteRuleSchema, 'rule'),
 
   saveRules: (rules: RouteRule[]) => {
     requireStorage().set(StorageKeys.RULES, JSON.stringify(rules));
@@ -234,7 +199,7 @@ export const StorageHelpers = {
 
   // — Events (history) —
   getEvents: (): ProcessedMessageEvent[] =>
-    readJsonArray(StorageKeys.EVENTS, isProcessedMessageEvent),
+    readJsonArray(StorageKeys.EVENTS, ProcessedMessageEventSchema, 'event'),
 
   appendEvent: (event: ProcessedMessageEvent) => {
     const events = StorageHelpers.getEvents();

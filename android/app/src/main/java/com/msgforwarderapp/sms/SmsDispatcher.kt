@@ -196,7 +196,8 @@ object SmsDispatcher {
     val out = mutableListOf<Destination>()
     for (i in 0 until array.length()) {
       val obj = array.optJSONObject(i) ?: continue
-      val id = obj.optString("id").ifEmpty { continue }
+      val id = obj.optString("id")
+      if (id.isEmpty()) continue
       val name = obj.optString("name")
       val providerObj = obj.optJSONObject("provider") ?: continue
       val provider =
@@ -229,8 +230,10 @@ object SmsDispatcher {
     val out = mutableListOf<Rule>()
     for (i in 0 until array.length()) {
       val obj = array.optJSONObject(i) ?: continue
-      val id = obj.optString("id").ifEmpty { continue }
-      val destinationId = obj.optString("destinationId").ifEmpty { continue }
+      val id = obj.optString("id")
+      if (id.isEmpty()) continue
+      val destinationId = obj.optString("destinationId")
+      if (destinationId.isEmpty()) continue
       out.add(
           Rule(
               id = id,

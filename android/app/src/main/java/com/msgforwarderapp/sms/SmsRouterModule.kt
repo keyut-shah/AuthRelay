@@ -14,11 +14,17 @@ class SmsRouterModule(private val reactContext: ReactApplicationContext) :
 
   @ReactMethod
   fun getListenerStatus(promise: Promise) {
+    val bootRestoredAt = ListenerState.getBootRestoredAt(reactContext)
+    val autostartAttemptedAt = ListenerState.getAutostartAttemptedAt(reactContext)
+    val ignoringBattery = PowerSettings.isIgnoringBatteryOptimizations(reactContext)
     val payload =
         Arguments.createMap().apply {
           putBoolean("receiverRegistered", true)
           putBoolean("bootRecoveryEnabled", true)
           putBoolean("foregroundServiceEnabled", false)
+          putBoolean("ignoringBatteryOptimizations", ignoringBattery)
+          putDouble("bootRestoredAt", bootRestoredAt.toDouble())
+          putDouble("autostartAttemptedAt", autostartAttemptedAt.toDouble())
         }
 
     promise.resolve(payload)
@@ -30,6 +36,32 @@ class SmsRouterModule(private val reactContext: ReactApplicationContext) :
       promise.resolve(SecureStore.getMmkvPassphrase(reactContext))
     } catch (t: Throwable) {
       promise.reject("E_SECURE_STORE", t.message, t)
+    }
+  }
+
+  @ReactMethod
+  fun isIgnoringBatteryOptimizations(promise: Promise) {
+    promise.resolve(PowerSettings.isIgnoringBatteryOptimizations(reactContext))
+  }
+
+  @ReactMethod
+  fun requestIgnoreBatteryOptimizations(promise: Promise) {
+    try {
+      val alreadyExempt = PowerSettings.requestIgnoreBatteryOptimizations(reactContext)
+      promise.resolve(alreadyExempt)
+    } catch (t: Throwable) {
+      promise.reject("E_BATTERY_REQUEST", t.message, t)
+    }
+  }
+
+  @ReactMethod
+  fun openAutostartSettings(promise: Promise) {
+    try {
+      val launchedKnownIntent = PowerSettings.openAutostartSettings(reactContext)
+      ListenerState.setAutostartAttempted(reactContext, System.currentTimeMillis())
+      promise.resolve(launchedKnownIntent)
+    } catch (t: Throwable) {
+      promise.reject("E_AUTOSTART", t.message, t)
     }
   }
 

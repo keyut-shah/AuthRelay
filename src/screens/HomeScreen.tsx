@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import {
   Alert,
+  AppState,
   KeyboardAvoidingView,
-  PermissionsAndroid,
   Platform,
   Pressable,
   ScrollView,
@@ -15,11 +15,17 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import {
+  checkSmsPermission,
   getListenerStatus,
+  isIgnoringBatteryOptimizations,
+  openAutostartSettings,
+  requestIgnoreBatteryOptimizations,
   requestSmsPermission,
   simulateIncomingSms,
   subscribeToIncomingSms,
 } from '../native/smsRouter';
+import type { ListenerStatus } from '../native/smsRouter';
+import { ReceiverFormSchema } from '../schemas';
 import { testDestination } from '../services/integrations';
 import { extractOtp, maskMessagePreview } from '../services/otp';
 import { StorageHelpers } from '../storage';
@@ -52,6 +58,15 @@ function buildRuleViews(
   return rules.map(rule => ({ rule, destination: byId.get(rule.destinationId) ?? null }));
 }
 
+function formatRelative(ms: number): string {
+  if (ms <= 0) return 'never';
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return 'moments ago';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return new Date(ms).toLocaleString();
+}
+
 export function HomeScreen() {
   const [rules, setRules] = useState<RouteRule[]>(StorageHelpers.getRules());
   const [destinations, setDestinations] = useState<DestinationConfig[]>(
@@ -65,12 +80,14 @@ export function HomeScreen() {
   // Permissions & Settings
   const [hasSmsPermission, setHasSmsPermission] = useState(false);
   const [ignoreBatteryOptimizations, setIgnoreBatteryOptimizations] = useState(false);
-  const [allowAutostart, setAllowAutostart] = useState(false);
+  const [autostartAttempted, setAutostartAttempted] = useState(false);
 
   // Form State
   const [receiverForm, setReceiverForm] = useState(initialForm);
+  const [formErrors, setFormErrors] = useState<Partial<Record<keyof ReceiverForm, string>>>({});
 
   // Listener & Events
+  const [listenerStatus, setListenerStatus] = useState<ListenerStatus | null>(null);
   const [listenerHealth, setListenerHealth] = useState('Checking listener status...');
   const [latestEvent, setLatestEvent] = useState<SmsEventPreview | null>(null);
   const [activeRuleId, setActiveRuleId] = useState<string | null>(null);
@@ -95,43 +112,44 @@ export function HomeScreen() {
     });
   }, [navigation, showWizard]);
 
+  // Reload all system state (permissions, battery, listener) on mount and
+  // whenever the app returns to foreground — covers the case where the user
+  // toggled a setting in Android Settings while the app was backgrounded.
   useEffect(() => {
-    // 1. Check existing SMS permission state so toggle reflects reality
-    const checkPermissions = async () => {
-      if (Platform.OS !== 'android') return;
-      const receive = await PermissionsAndroid.check(
-        PermissionsAndroid.PERMISSIONS.RECEIVE_SMS,
-      );
-      if (receive) {
-        setHasSmsPermission(true);
-      } else {
-        // Auto-prompt on first launch so user sees the system dialog immediately
-        const granted = await requestSmsPermission();
-        setHasSmsPermission(granted);
+    const reloadSystemState = async () => {
+      try {
+        const [permission, status, battery] = await Promise.all([
+          checkSmsPermission(),
+          getListenerStatus(),
+          isIgnoringBatteryOptimizations(),
+        ]);
+        setHasSmsPermission(permission);
+        setIgnoreBatteryOptimizations(battery);
+        if (status) {
+          setListenerStatus(status);
+          setAutostartAttempted(status.autostartAttemptedAt > 0);
+          setListenerHealth(
+            permission
+              ? status.bootRestoredAt > 0
+                ? `Active · restored after reboot ${formatRelative(status.bootRestoredAt)}`
+                : 'Active'
+              : 'Inactive — SMS permission required',
+          );
+        } else {
+          setListenerHealth('Listener disconnected');
+        }
+      } catch {
+        setListenerHealth('Unable to verify listener status');
       }
     };
 
-    checkPermissions();
+    reloadSystemState();
 
-    // 2. Load listener status from the native bridge
-    const loadListenerStatus = async () => {
-      const status = await getListenerStatus();
-      if (!status) {
-        setListenerHealth('Listener disconnected');
-        return;
-      }
-      setListenerHealth(
-        status.bootRecoveryEnabled
-          ? 'Active (Boot recovery enabled)'
-          : 'Active (Pending boot recovery)',
-      );
-    };
-
-    loadListenerStatus().catch(() => {
-      setListenerHealth('Unable to verify listener status');
+    const appStateSub = AppState.addEventListener('change', state => {
+      if (state === 'active') reloadSystemState();
     });
 
-    // 3. Subscribe to live SMS events for display only.
+    // Subscribe to live SMS events for display only.
     // Actual Telegram forwarding is handled natively (SmsDispatcher.kt) so it
     // keeps working when the JS bundle is dead.
     const subscription = subscribeToIncomingSms(event => {
@@ -140,19 +158,19 @@ export function HomeScreen() {
 
     return () => {
       subscription.remove();
+      appStateSub.remove();
     };
   }, []);
 
-  const canFinishSetup =
-    hasSmsPermission &&
-    receiverForm.teamName.trim().length > 0 &&
-    receiverForm.telegramName.trim().length > 0 &&
-    receiverForm.telegramBotToken.trim().length > 0 &&
-    receiverForm.telegramChatId.trim().length > 0 &&
-    receiverForm.senderFilter.trim().length > 0;
-
   const updateForm = <K extends keyof ReceiverForm>(key: K, value: ReceiverForm[K]) => {
     setReceiverForm(prev => ({ ...prev, [key]: value }));
+    if (formErrors[key]) {
+      setFormErrors(prev => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+    }
   };
 
   const startNewRoute = () => {
@@ -162,26 +180,46 @@ export function HomeScreen() {
   };
 
   const finishSetup = () => {
-    if (!canFinishSetup) return;
-    const trimmedFilter = receiverForm.senderFilter.trim();
-    if (trimmedFilter.length === 0) return;
+    // zod is the source of truth for whether the form is acceptable.
+    const result = ReceiverFormSchema.safeParse(receiverForm);
+    if (!result.success) {
+      const fieldErrors: Partial<Record<keyof ReceiverForm, string>> = {};
+      const flat = result.error.flatten().fieldErrors;
+      (Object.keys(flat) as (keyof ReceiverForm)[]).forEach(key => {
+        const msg = flat[key]?.[0];
+        if (msg) fieldErrors[key] = msg;
+      });
+      setFormErrors(fieldErrors);
+      // Jump back to the first step that has an error.
+      if (fieldErrors.teamName) setCurrentStep(0);
+      else if (fieldErrors.telegramName || fieldErrors.telegramBotToken || fieldErrors.telegramChatId) setCurrentStep(2);
+      else if (fieldErrors.senderFilter) setCurrentStep(3);
+      return;
+    }
+    if (!hasSmsPermission) {
+      Alert.alert('Permission required', 'Grant SMS access before creating a route.');
+      setCurrentStep(1);
+      return;
+    }
+
+    const clean = result.data;
 
     // Create a fresh destination + rule pair. Reusing an existing destination
     // across rules is a follow-up feature (the data model supports it).
     const destination: DestinationConfig = {
       id: StorageHelpers.newDestinationId(),
-      name: receiverForm.telegramName.trim(),
+      name: clean.telegramName,
       provider: {
         type: 'telegram',
-        botToken: receiverForm.telegramBotToken.trim(),
-        chatId: receiverForm.telegramChatId.trim(),
+        botToken: clean.telegramBotToken,
+        chatId: clean.telegramChatId,
       },
     };
     const rule: RouteRule = {
       id: StorageHelpers.newRuleId(),
       enabled: true,
-      teamName: receiverForm.teamName.trim(),
-      senderPattern: trimmedFilter,
+      teamName: clean.teamName,
+      senderPattern: clean.senderFilter,
       senderMatchMode: 'contains',
       destinationId: destination.id,
     };
@@ -191,6 +229,7 @@ export function HomeScreen() {
     setDestinations(updatedDestinations);
     setRules(updatedRules);
     setReceiverForm(initialForm);
+    setFormErrors({});
     setShowWizard(false);
   };
 
@@ -211,10 +250,47 @@ export function HomeScreen() {
   };
 
   const handlePermissionRequest = async () => {
+    if (hasSmsPermission) {
+      Alert.alert(
+        'Permission already granted',
+        'SMS access is enabled. To revoke it, open the system Settings app.',
+      );
+      return;
+    }
     const granted = await requestSmsPermission();
     setHasSmsPermission(granted);
     if (!granted) {
-      Alert.alert('Permission Required', 'SMS access is mandatory for OTP forwarding.');
+      Alert.alert(
+        'Permission required',
+        'AuthRelay needs SMS access to detect incoming OTPs. Enable it in Settings if the dialog was dismissed.',
+      );
+    }
+  };
+
+  const handleBatteryToggle = async () => {
+    if (ignoreBatteryOptimizations) {
+      Alert.alert(
+        'Already unrestricted',
+        'AuthRelay is already exempt from battery optimization. To revoke, open Android battery settings.',
+      );
+      return;
+    }
+    const alreadyExempt = await requestIgnoreBatteryOptimizations();
+    if (alreadyExempt) {
+      setIgnoreBatteryOptimizations(true);
+    }
+    // Otherwise the system dialog is now visible — when the user returns to
+    // the app, the AppState listener re-reads the actual value.
+  };
+
+  const handleAutostartTrigger = async () => {
+    const launched = await openAutostartSettings();
+    setAutostartAttempted(true);
+    if (!launched) {
+      Alert.alert(
+        'Open Autostart manually',
+        'This device does not expose a standard autostart screen. The app-details page is now open — find the "Autostart" or "Run in background" toggle and enable it.',
+      );
     }
   };
 
@@ -267,12 +343,15 @@ export function HomeScreen() {
             <View style={styles.inputWrapper}>
               <Text style={styles.inputLabel}>Team Name</Text>
               <TextInput
-                style={styles.input}
+                style={[styles.input, formErrors.teamName && styles.inputError]}
                 placeholder="e.g., Engineering, Finance"
                 placeholderTextColor={palette.textMuted}
                 value={receiverForm.teamName}
                 onChangeText={val => updateForm('teamName', val)}
               />
+              {formErrors.teamName ? (
+                <Text style={styles.fieldError}>{formErrors.teamName}</Text>
+              ) : null}
             </View>
           </View>
         );
@@ -281,14 +360,18 @@ export function HomeScreen() {
           <View style={styles.stepContent}>
             <Text style={styles.stepTitle}>System Access</Text>
             <Text style={styles.stepDescription}>
-              To reliably forward messages, AuthRelay needs background execution and SMS permissions.
+              AuthRelay reads incoming SMS locally to detect OTPs and forwards them to your
+              configured destination. Nothing is sent to a cloud server. The settings below
+              keep the listener alive in the background.
             </Text>
 
             <View style={styles.permissionCard}>
               <View style={styles.permissionHeader}>
-                <View>
+                <View style={styles.permissionTextWrap}>
                   <Text style={styles.permissionTitle}>Read SMS</Text>
-                  <Text style={styles.permissionSubtitle}>Required to capture OTPs</Text>
+                  <Text style={styles.permissionSubtitle}>
+                    Required to capture OTPs. Only senders that match a route are processed.
+                  </Text>
                 </View>
                 <Switch
                   value={hasSmsPermission}
@@ -301,13 +384,15 @@ export function HomeScreen() {
               <View style={styles.separator} />
 
               <View style={styles.permissionHeader}>
-                <View>
+                <View style={styles.permissionTextWrap}>
                   <Text style={styles.permissionTitle}>Battery Unrestricted</Text>
-                  <Text style={styles.permissionSubtitle}>Prevents app termination</Text>
+                  <Text style={styles.permissionSubtitle}>
+                    Prevents Android from killing the listener to save power.
+                  </Text>
                 </View>
                 <Switch
                   value={ignoreBatteryOptimizations}
-                  onValueChange={setIgnoreBatteryOptimizations}
+                  onValueChange={handleBatteryToggle}
                   trackColor={{ false: palette.border, true: palette.accent }}
                   thumbColor={palette.panel}
                 />
@@ -316,16 +401,29 @@ export function HomeScreen() {
               <View style={styles.separator} />
 
               <View style={styles.permissionHeader}>
-                <View>
+                <View style={styles.permissionTextWrap}>
                   <Text style={styles.permissionTitle}>Auto-start (OEM)</Text>
-                  <Text style={styles.permissionSubtitle}>Required on some Androids</Text>
+                  <Text style={styles.permissionSubtitle}>
+                    Required on Xiaomi, Oppo, Vivo, Huawei and similar devices so SMS
+                    receivers fire after a reboot.
+                  </Text>
+                  {autostartAttempted ? (
+                    <Text style={styles.permissionHint}>
+                      Settings opened — confirm autostart is enabled there.
+                    </Text>
+                  ) : null}
                 </View>
-                <Switch
-                  value={allowAutostart}
-                  onValueChange={setAllowAutostart}
-                  trackColor={{ false: palette.border, true: palette.accent }}
-                  thumbColor={palette.panel}
-                />
+                <Pressable
+                  onPress={handleAutostartTrigger}
+                  style={({ pressed }) => [
+                    styles.autostartButton,
+                    pressed && styles.autostartButtonPressed,
+                  ]}
+                >
+                  <Text style={styles.autostartButtonText}>
+                    {autostartAttempted ? 'Reopen' : 'Open'}
+                  </Text>
+                </Pressable>
               </View>
             </View>
           </View>
@@ -341,18 +439,21 @@ export function HomeScreen() {
             <View style={styles.inputWrapper}>
               <Text style={styles.inputLabel}>Receiver Name</Text>
               <TextInput
-                style={styles.input}
+                style={[styles.input, formErrors.telegramName && styles.inputError]}
                 placeholder="e.g., Auth Alerts Bot"
                 placeholderTextColor={palette.textMuted}
                 value={receiverForm.telegramName}
                 onChangeText={val => updateForm('telegramName', val)}
               />
+              {formErrors.telegramName ? (
+                <Text style={styles.fieldError}>{formErrors.telegramName}</Text>
+              ) : null}
             </View>
 
             <View style={styles.inputWrapper}>
               <Text style={styles.inputLabel}>Bot Token</Text>
               <TextInput
-                style={styles.input}
+                style={[styles.input, formErrors.telegramBotToken && styles.inputError]}
                 placeholder="123456789:AA..."
                 placeholderTextColor={palette.textMuted}
                 value={receiverForm.telegramBotToken}
@@ -360,18 +461,24 @@ export function HomeScreen() {
                 secureTextEntry
                 autoCapitalize="none"
               />
+              {formErrors.telegramBotToken ? (
+                <Text style={styles.fieldError}>{formErrors.telegramBotToken}</Text>
+              ) : null}
             </View>
 
             <View style={styles.inputWrapper}>
               <Text style={styles.inputLabel}>Chat ID</Text>
               <TextInput
-                style={styles.input}
-                placeholder="-10012345678"
+                style={[styles.input, formErrors.telegramChatId && styles.inputError]}
+                placeholder="-10012345678 or @channelusername"
                 placeholderTextColor={palette.textMuted}
                 value={receiverForm.telegramChatId}
                 onChangeText={val => updateForm('telegramChatId', val)}
                 autoCapitalize="none"
               />
+              {formErrors.telegramChatId ? (
+                <Text style={styles.fieldError}>{formErrors.telegramChatId}</Text>
+              ) : null}
             </View>
           </View>
         );
@@ -386,13 +493,16 @@ export function HomeScreen() {
             <View style={styles.inputWrapper}>
               <Text style={styles.inputLabel}>Allowed Sender</Text>
               <TextInput
-                style={styles.input}
+                style={[styles.input, formErrors.senderFilter && styles.inputError]}
                 placeholder="e.g., AWS, GITHUB, BANK"
                 placeholderTextColor={palette.textMuted}
                 value={receiverForm.senderFilter}
                 onChangeText={val => updateForm('senderFilter', val)}
                 autoCapitalize="characters"
               />
+              {formErrors.senderFilter ? (
+                <Text style={styles.fieldError}>{formErrors.senderFilter}</Text>
+              ) : null}
             </View>
 
             <View style={styles.summaryCard}>
@@ -447,13 +557,7 @@ export function HomeScreen() {
           </ScrollView>
 
           <View style={styles.footer}>
-            <Pressable
-              style={[
-                styles.primaryButton,
-                currentStep === 3 && !canFinishSetup && styles.buttonDisabled
-              ]}
-              onPress={goNext}
-            >
+            <Pressable style={styles.primaryButton} onPress={goNext}>
               <Text style={styles.primaryButtonText}>
                 {currentStep === 3 ? 'Complete Setup' : 'Continue'}
               </Text>
@@ -465,17 +569,65 @@ export function HomeScreen() {
   }
 
   // HOME DASHBOARD VIEW
+  const listenerDotColor = hasSmsPermission ? palette.success : palette.danger;
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.homeHeader}>
         <Text style={styles.appTitle}>AuthRelay</Text>
         <View style={styles.listenerStatusRow}>
-          <View style={[styles.statusDot, { backgroundColor: palette.success }]} />
+          <View style={[styles.statusDot, { backgroundColor: listenerDotColor }]} />
           <Text style={styles.statusText}>{listenerHealth}</Text>
         </View>
       </View>
 
       <ScrollView style={styles.scrollArea} contentContainerStyle={styles.homeScrollContent}>
+
+        {!hasSmsPermission ? (
+          <View style={styles.permissionBanner}>
+            <Text style={styles.permissionBannerTitle}>SMS access required</Text>
+            <Text style={styles.permissionBannerBody}>
+              The listener can't forward OTPs without permission to read incoming SMS. Only
+              senders that match a route will be processed.
+            </Text>
+            <Pressable
+              style={styles.permissionBannerButton}
+              onPress={handlePermissionRequest}
+            >
+              <Text style={styles.permissionBannerButtonText}>Grant SMS access</Text>
+            </Pressable>
+          </View>
+        ) : null}
+
+        {listenerStatus ? (
+          <View style={styles.systemStatusCard}>
+            <Text style={styles.cardEyebrow}>SYSTEM STATUS</Text>
+            <View style={styles.systemStatusRow}>
+              <Text style={styles.systemStatusLabel}>Battery optimization</Text>
+              <Text
+                style={[
+                  styles.systemStatusValue,
+                  !listenerStatus.ignoringBatteryOptimizations && styles.systemStatusValueWarn,
+                ]}
+              >
+                {listenerStatus.ignoringBatteryOptimizations ? 'Unrestricted' : 'May terminate app'}
+              </Text>
+            </View>
+            <View style={styles.systemStatusRow}>
+              <Text style={styles.systemStatusLabel}>Autostart configured</Text>
+              <Text style={styles.systemStatusValue}>
+                {autostartAttempted ? 'Attempted — verify on device' : 'Not configured'}
+              </Text>
+            </View>
+            {listenerStatus.bootRestoredAt > 0 ? (
+              <View style={styles.systemStatusRow}>
+                <Text style={styles.systemStatusLabel}>Last boot recovery</Text>
+                <Text style={styles.systemStatusValue}>
+                  {formatRelative(listenerStatus.bootRestoredAt)}
+                </Text>
+              </View>
+            ) : null}
+          </View>
+        ) : null}
 
         {/* Latest Event Card */}
         <View style={styles.card}>
@@ -991,5 +1143,100 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: palette.textPrimary,
+  },
+  // Permission banner + system-status card
+  permissionBanner: {
+    marginTop: 20,
+    padding: 16,
+    backgroundColor: palette.dangerLight,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: palette.danger,
+  },
+  permissionBannerTitle: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: palette.danger,
+    marginBottom: 4,
+  },
+  permissionBannerBody: {
+    fontSize: 13,
+    color: palette.textSecondary,
+    lineHeight: 18,
+    marginBottom: 12,
+  },
+  permissionBannerButton: {
+    alignSelf: 'flex-start',
+    backgroundColor: palette.danger,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  permissionBannerButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  systemStatusCard: {
+    backgroundColor: palette.panel,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: palette.border,
+    padding: 16,
+    marginTop: 16,
+  },
+  systemStatusRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 4,
+  },
+  systemStatusLabel: {
+    fontSize: 13,
+    color: palette.textSecondary,
+    fontWeight: '500',
+  },
+  systemStatusValue: {
+    fontSize: 13,
+    color: palette.textPrimary,
+    fontWeight: '600',
+  },
+  systemStatusValueWarn: {
+    color: palette.danger,
+  },
+  // Wizard permissions extras
+  permissionTextWrap: {
+    flex: 1,
+    paddingRight: 12,
+  },
+  permissionHint: {
+    fontSize: 12,
+    color: palette.success,
+    marginTop: 4,
+    fontWeight: '600',
+  },
+  autostartButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    backgroundColor: palette.accent,
+  },
+  autostartButtonPressed: {
+    opacity: 0.7,
+  },
+  autostartButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  // Form errors
+  inputError: {
+    borderColor: palette.danger,
+  },
+  fieldError: {
+    color: palette.danger,
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 6,
+    marginLeft: 4,
   },
 });
