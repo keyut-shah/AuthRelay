@@ -12,8 +12,9 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 
 import {
   checkSmsPermission,
@@ -153,6 +154,8 @@ function buildSimulationSender(rule: RouteRule): string {
 }
 
 export function HomeScreen() {
+  const insets = useSafeAreaInsets();
+  const tabBarHeight = useBottomTabBarHeight();
   const [rules, setRules] = useState<RouteRule[]>(StorageHelpers.getRules());
   const [destinations, setDestinations] = useState<DestinationConfig[]>(
     StorageHelpers.getDestinations(),
@@ -187,12 +190,12 @@ export function HomeScreen() {
         : {
             backgroundColor: palette.panel,
             borderTopColor: palette.border,
-            height: 64,
+            height: 56 + insets.bottom,
             paddingTop: 6,
-            paddingBottom: 8,
+            paddingBottom: Math.max(insets.bottom, 8),
           },
     });
-  }, [navigation, showWizard]);
+  }, [insets.bottom, navigation, showWizard]);
 
   useEffect(() => {
     const reloadSystemState = async () => {
@@ -1012,11 +1015,15 @@ export function HomeScreen() {
             <View style={styles.placeholder} />
           </View>
 
-          <ScrollView style={styles.scrollArea} keyboardShouldPersistTaps="handled">
+          <ScrollView
+            style={styles.scrollArea}
+            contentContainerStyle={styles.wizardScrollContent}
+            keyboardShouldPersistTaps="handled"
+          >
             {renderWizardStep()}
           </ScrollView>
 
-          <View style={styles.footer}>
+          <View style={[styles.footer, { paddingBottom: 20 + insets.bottom }]}>
             <Pressable style={styles.primaryButton} onPress={goNext}>
               <Text style={styles.primaryButtonText}>
                 {currentStep === stepLabels.length - 1 ? 'Complete Setup' : 'Continue'}
@@ -1040,7 +1047,13 @@ export function HomeScreen() {
         </View>
       </View>
 
-      <ScrollView style={styles.scrollArea} contentContainerStyle={styles.homeScrollContent}>
+      <ScrollView
+        style={styles.scrollArea}
+        contentContainerStyle={[
+          styles.homeScrollContent,
+          { paddingBottom: tabBarHeight + 16 },
+        ]}
+      >
         {!hasSmsPermission ? (
           <View style={styles.permissionBanner}>
             <Text style={styles.permissionBannerTitle}>SMS access required</Text>
@@ -1216,8 +1229,11 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingHorizontal: 20,
   },
+  wizardScrollContent: {
+    paddingBottom: 24,
+  },
   homeScrollContent: {
-    paddingBottom: 40,
+    paddingTop: 0,
   },
   homeHeader: {
     paddingHorizontal: 20,

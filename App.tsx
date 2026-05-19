@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, StatusBar, StyleSheet, Text, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
-import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 
@@ -19,7 +19,8 @@ function TabIcon({ glyph, color }: { glyph: string; color: string }) {
 const renderHomeIcon = ({ color }: { color: string }) => <TabIcon glyph="●" color={color} />;
 const renderHistoryIcon = ({ color }: { color: string }) => <TabIcon glyph="◆" color={color} />;
 
-function App(): React.JSX.Element {
+function AppShell(): React.JSX.Element {
+  const insets = useSafeAreaInsets();
   const [ready, setReady] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
 
@@ -35,53 +36,67 @@ function App(): React.JSX.Element {
 
   if (initError) {
     return (
-      <SafeAreaProvider>
+      <>
         <StatusBar barStyle="dark-content" backgroundColor={palette.bg} />
         <View style={styles.center}>
           <Text style={styles.errorTitle}>Secure storage unavailable</Text>
           <Text style={styles.errorBody}>{initError}</Text>
         </View>
-      </SafeAreaProvider>
+      </>
     );
   }
 
   if (!ready) {
     return (
-      <SafeAreaProvider>
+      <>
         <StatusBar barStyle="dark-content" backgroundColor={palette.bg} />
         <View style={styles.center}>
           <ActivityIndicator color={palette.accent} />
         </View>
-      </SafeAreaProvider>
+      </>
     );
   }
 
   return (
+    <>
+      <StatusBar barStyle="dark-content" backgroundColor={palette.bg} />
+      <NavigationContainer>
+        <Tab.Navigator
+          screenOptions={{
+            headerShown: false,
+            tabBarActiveTintColor: palette.accent,
+            tabBarInactiveTintColor: palette.textMuted,
+            tabBarStyle: [
+              styles.tabBar,
+              {
+                height: 56 + insets.bottom,
+                paddingBottom: Math.max(insets.bottom, 8),
+              },
+            ],
+            tabBarLabelStyle: styles.tabLabel,
+          }}
+        >
+          <Tab.Screen
+            name="Home"
+            component={HomeScreen}
+            options={{ tabBarIcon: renderHomeIcon }}
+          />
+          <Tab.Screen
+            name="History"
+            component={HistoryScreen}
+            options={{ tabBarIcon: renderHistoryIcon }}
+          />
+        </Tab.Navigator>
+      </NavigationContainer>
+    </>
+  );
+}
+
+function App(): React.JSX.Element {
+  return (
     <GestureHandlerRootView style={styles.flex}>
       <SafeAreaProvider>
-        <StatusBar barStyle="dark-content" backgroundColor={palette.bg} />
-        <NavigationContainer>
-          <Tab.Navigator
-            screenOptions={{
-              headerShown: false,
-              tabBarActiveTintColor: palette.accent,
-              tabBarInactiveTintColor: palette.textMuted,
-              tabBarStyle: styles.tabBar,
-              tabBarLabelStyle: styles.tabLabel,
-            }}
-          >
-            <Tab.Screen
-              name="Home"
-              component={HomeScreen}
-              options={{ tabBarIcon: renderHomeIcon }}
-            />
-            <Tab.Screen
-              name="History"
-              component={HistoryScreen}
-              options={{ tabBarIcon: renderHistoryIcon }}
-            />
-          </Tab.Navigator>
-        </NavigationContainer>
+        <AppShell />
       </SafeAreaProvider>
     </GestureHandlerRootView>
   );
@@ -111,9 +126,7 @@ const styles = StyleSheet.create({
   tabBar: {
     backgroundColor: palette.panel,
     borderTopColor: palette.border,
-    height: 64,
     paddingTop: 6,
-    paddingBottom: 8,
   },
   tabLabel: {
     fontSize: 11,

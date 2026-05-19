@@ -44,7 +44,7 @@ class TelegramAdapter(
       append(describeSenderRule(payload.rule))
       append('\n')
       append("Destination: ")
-      append(payload.destination.name)
+      append("Telegram Chat")
       append('\n')
       append('\n')
       append(payload.rawMessage)

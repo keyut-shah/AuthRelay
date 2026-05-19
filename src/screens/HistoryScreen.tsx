@@ -11,6 +11,7 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 
 import { subscribeToEventHistoryUpdated } from '../native/smsRouter';
 import { StorageHelpers } from '../storage';
@@ -57,6 +58,7 @@ function formatExactTime(ms: number): string {
 }
 
 export function HistoryScreen() {
+  const tabBarHeight = useBottomTabBarHeight();
   const [events, setEvents] = useState<ProcessedMessageEvent[]>([]);
   const [routeFilter, setRouteFilter] = useState<string>(ALL_ROUTES);
   const [refreshing, setRefreshing] = useState(false);
@@ -224,7 +226,10 @@ export function HistoryScreen() {
         data={filteredEvents}
         keyExtractor={event => event.id}
         renderItem={renderItem}
-        contentContainerStyle={styles.listContent}
+        contentContainerStyle={[
+          styles.listContent,
+          { paddingBottom: tabBarHeight + 16 },
+        ]}
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} tintColor={palette.accent} />
         }
@@ -345,7 +350,6 @@ const styles = StyleSheet.create({
   listContent: {
     paddingHorizontal: 20,
     paddingVertical: 16,
-    paddingBottom: 40,
     gap: 12,
   },
   eventCard: {
