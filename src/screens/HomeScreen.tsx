@@ -32,7 +32,7 @@ import { RouteFormSchema } from '../schemas';
 import { buildTelegramDestinationName, getDestinationDisplayName } from '../services/destinations';
 import { testDestination } from '../services/integrations';
 import { extractOtp, maskMessagePreview } from '../services/otp';
-import { describeSenderRule, parsePhraseList } from '../services/routing';
+import { describeSenderRule, parsePhraseList, parseSenderList } from '../services/routing';
 import { StorageHelpers } from '../storage';
 import { palette } from '../theme';
 import type {
@@ -53,6 +53,11 @@ const initialForm: RouteForm = {
   senderPattern: '',
   contactDisplayName: '',
   contactPhoneNumbers: [],
+  // Phase A defaults: keep current OTP-relay behavior. Phase B will expose
+  // these as wizard controls so the user can opt out of the OTP gate or pick
+  // a more precise match mode (whole-word / regex).
+  requireOtp: true,
+  matchMode: 'contains',
   useMessageFilters: false,
   messageFilterMode: 'include',
   messageAllowInput: '',
@@ -78,16 +83,24 @@ function formatRelative(ms: number): string {
 
 function buildRuleNarrative(form: RouteForm): string {
   const destinationName = buildTelegramDestinationName(form.telegramChatId);
-  const source =
-    form.senderSourceType === 'any'
-      ? 'every sender on this device'
-      : form.senderSourceType === 'contact'
-        ? form.contactDisplayName
-          ? `${form.contactDisplayName} (${form.contactPhoneNumbers[0] || 'no number'})`
-          : 'a saved contact'
-        : form.senderPattern
-          ? `sender IDs or numbers containing "${form.senderPattern.trim()}"`
-          : 'a sender ID or number';
+
+  let source: string;
+  if (form.senderSourceType === 'any') {
+    source = 'every sender on this device';
+  } else if (form.senderSourceType === 'contact') {
+    source = form.contactDisplayName
+      ? `${form.contactDisplayName} (${form.contactPhoneNumbers[0] || 'no number'})`
+      : 'a saved contact';
+  } else {
+    const entries = parseSenderList(form.senderPattern);
+    if (entries.length === 0) {
+      source = 'a sender ID or number';
+    } else if (entries.length === 1) {
+      source = `messages from "${entries[0]}"`;
+    } else {
+      source = `messages from ${entries.map(e => `"${e}"`).join(', ')}`;
+    }
+  }
 
   const allowPatterns = parsePhraseList(form.messageAllowInput);
   const blockPatterns = parsePhraseList(form.messageBlockInput);
@@ -397,6 +410,8 @@ export function HomeScreen() {
         clean.senderSourceType === 'contact'
           ? clean.contactPhoneNumbers.map(p => p.trim()).filter(Boolean)
           : [],
+      requireOtp: clean.requireOtp,
+      matchMode: clean.matchMode,
       messageAllowPatterns:
         clean.useMessageFilters && clean.messageFilterMode !== 'exclude'
           ? parsePhraseList(clean.messageAllowInput)
@@ -684,15 +699,16 @@ export function HomeScreen() {
       <Text style={styles.inputLabel}>Sender ID or Number</Text>
       <TextInput
         style={[styles.input, formErrors.senderPattern && styles.inputError]}
-        placeholder="e.g., AWS, HDFCBK, +919876..."
+        placeholder="HDFCBK, AWS, AMAZON, +91 98765 43210"
         placeholderTextColor={palette.textMuted}
         value={routeForm.senderPattern}
         onChangeText={value => updateForm('senderPattern', value)}
-        autoCapitalize="characters"
+        autoCapitalize="none"
       />
       <Text style={styles.inputHint}>
-        Forward OTPs only when the SMS sender contains this text. Use this for bank short
-        codes, app names, or a phone number.
+        Comma-separated. Any match forwards. Case doesn't matter — "aws" and "AWS" are
+        the same. For phone numbers, spaces / +country code / dashes are ignored when
+        matching.
       </Text>
       {formErrors.senderPattern ? (
         <Text style={styles.fieldError}>{formErrors.senderPattern}</Text>
@@ -849,7 +865,9 @@ export function HomeScreen() {
                 value={routeForm.messageAllowInput}
                 onChangeText={value => updateForm('messageAllowInput', value)}
               />
-              <Text style={styles.inputHint}>Use commas to add multiple phrases.</Text>
+              <Text style={styles.inputHint}>
+                Comma-separated. Any phrase matching is enough. Case doesn't matter.
+              </Text>
               {formErrors.messageAllowInput ? (
                 <Text style={styles.fieldError}>{formErrors.messageAllowInput}</Text>
               ) : null}
@@ -866,7 +884,10 @@ export function HomeScreen() {
                 value={routeForm.messageBlockInput}
                 onChangeText={value => updateForm('messageBlockInput', value)}
               />
-              <Text style={styles.inputHint}>Blocked phrases take priority over includes.</Text>
+              <Text style={styles.inputHint}>
+                Comma-separated. If any phrase appears, the message is dropped. Case
+                doesn't matter. Blocked phrases override includes.
+              </Text>
               {formErrors.messageBlockInput ? (
                 <Text style={styles.fieldError}>{formErrors.messageBlockInput}</Text>
               ) : null}
@@ -902,12 +923,17 @@ export function HomeScreen() {
         parsePhraseList(routeForm.messageBlockInput).length > 0);
     const showAnySenderWarning = routeForm.senderSourceType === 'any' && !hasFilters;
 
+    const senderEntries = parseSenderList(routeForm.senderPattern);
     const sourceLabel =
       routeForm.senderSourceType === 'any'
         ? 'Any sender on this device'
         : routeForm.senderSourceType === 'contact'
           ? routeForm.contactDisplayName || 'Saved contact'
-          : routeForm.senderPattern || 'Sender ID or number';
+          : senderEntries.length === 0
+            ? 'Sender ID or number'
+            : senderEntries.length === 1
+              ? senderEntries[0]
+              : `${senderEntries.length} senders (${senderEntries.join(', ')})`;
 
     return (
       <View style={styles.stepContent}>

@@ -26,6 +26,13 @@ export type DestinationConfig = {
 export type SenderSourceType = 'any' | 'sender_id' | 'contact';
 export type MessageFilterMode = 'include' | 'exclude' | 'advanced';
 
+/**
+ * How allow/block phrases are matched against the message body.
+ * Phase A introduces this so the dispatcher can support more than naive
+ * `contains` matching. Phase B exposes the picker in the wizard.
+ */
+export type MatchMode = 'contains' | 'whole_word' | 'regex';
+
 export type RouteRule = {
   id: string;
   enabled: boolean;
@@ -34,6 +41,15 @@ export type RouteRule = {
   senderPattern: string;
   contactDisplayName: string | null;
   contactPhoneNumbers: string[];
+
+  /**
+   * When true, the route only forwards messages that contain an OTP-shaped
+   * code. Was the implicit, unconditional dispatcher gate before Phase A —
+   * now per-rule so non-OTP forwarding routes are possible.
+   */
+  requireOtp: boolean;
+  /** How allow/block phrases are matched. */
+  matchMode: MatchMode;
   messageAllowPatterns: string[];
   messageBlockPatterns: string[];
   destinationId: string;
@@ -51,6 +67,8 @@ export type RouteForm = {
   senderPattern: string;
   contactDisplayName: string;
   contactPhoneNumbers: string[];
+  requireOtp: boolean;
+  matchMode: MatchMode;
   useMessageFilters: boolean;
   messageFilterMode: MessageFilterMode;
   messageAllowInput: string;

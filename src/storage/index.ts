@@ -101,6 +101,8 @@ export function migrateLegacyRoutes(raw: unknown): {
       senderPattern: legacy.senderFilter.trim(),
       contactDisplayName: null,
       contactPhoneNumbers: [],
+      requireOtp: true,
+      matchMode: 'contains',
       messageAllowPatterns: [],
       messageBlockPatterns: [],
       destinationId,

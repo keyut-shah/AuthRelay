@@ -48,6 +48,9 @@ const RawRouteRuleSchema = z.object({
   senderPattern: z.string().optional(),
   contactDisplayName: z.string().nullable().optional(),
   contactPhoneNumbers: phraseArray,
+  // Phase A additions — both default so old saved rules keep current behavior.
+  requireOtp: z.boolean().optional(),
+  matchMode: z.enum(['contains', 'whole_word', 'regex']).optional(),
   messageAllowPatterns: phraseArray,
   messageBlockPatterns: phraseArray,
   destinationId: z.string().min(1),
@@ -63,6 +66,10 @@ export const RouteRuleSchema = RawRouteRuleSchema.transform(raw => ({
   contactPhoneNumbers: raw.contactPhoneNumbers
     .map(value => value.trim())
     .filter(Boolean),
+  // Migration: existing rules predate these fields; default keeps the legacy
+  // behavior (OTP gate ON, plain substring matching).
+  requireOtp: raw.requireOtp ?? true,
+  matchMode: raw.matchMode ?? 'contains',
   messageAllowPatterns: raw.messageAllowPatterns
     .map(value => value.trim())
     .filter(Boolean),
@@ -120,6 +127,8 @@ export const RouteFormSchema = z
     senderPattern: z.string().trim(),
     contactDisplayName: z.string().trim(),
     contactPhoneNumbers: z.array(z.string()).catch([]),
+    requireOtp: z.boolean(),
+    matchMode: z.enum(['contains', 'whole_word', 'regex']),
     useMessageFilters: z.boolean(),
     messageFilterMode: z.enum(['include', 'exclude', 'advanced']),
     messageAllowInput: z.string(),

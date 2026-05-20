@@ -59,6 +59,9 @@ test('normalizes stored rules saved with the old team-based shape', () => {
       senderPattern: 'AWS',
       contactDisplayName: null,
       contactPhoneNumbers: [],
+      // Phase A defaults applied during normalization to preserve legacy behavior.
+      requireOtp: true,
+      matchMode: 'contains',
       messageAllowPatterns: [],
       messageBlockPatterns: [],
       destinationId: 'dest_1',

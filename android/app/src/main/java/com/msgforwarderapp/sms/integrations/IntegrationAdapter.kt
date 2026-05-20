@@ -25,6 +25,10 @@ data class Rule(
     val senderPattern: String,
     val contactDisplayName: String?,
     val contactPhoneNumbers: List<String>,
+    /** Phase A: per-rule OTP gate (was implicit and unconditional before). */
+    val requireOtp: Boolean,
+    /** "contains" | "whole_word" | "regex". Defaults to "contains". */
+    val matchMode: String,
     val messageAllowPatterns: List<String>,
     val messageBlockPatterns: List<String>,
     val destinationId: String,

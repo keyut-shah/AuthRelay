@@ -14,6 +14,8 @@ import com.tencent.mmkv.MMKV
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.regex.Pattern
+import java.util.regex.PatternSyntaxException
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -54,22 +56,10 @@ object SmsDispatcher {
   }
 
   private fun dispatchInternal(context: Context, sender: String, message: String) {
+    // OTP extraction always runs — the masked code is recorded in history
+    // even for non-OTP rules. The actual OTP *gate* is now per-rule (see
+    // rule.requireOtp) so general-forwarder rules work.
     val otp = OtpExtractor.extract(message)
-
-    if (otp.code == null) {
-      logEvent(
-          context = context,
-          sender = sender,
-          status = "ignored",
-          maskedCode = null,
-          matchedRuleId = null,
-          matchedRouteName = null,
-          destinationName = null,
-          reason = "no_otp_detected",
-      )
-      Log.i(TAG, "SMS from $sender contains no OTP-like code; ignoring")
-      return
-    }
 
     val destinations = loadDestinations(context)
     val rules = loadRules(context)
@@ -166,7 +156,13 @@ object SmsDispatcher {
 
   private fun ruleMatches(rule: Rule, sender: String, message: String): Boolean {
     if (!rule.enabled) return false
+    if (!doesRuleOtpGatePass(rule, message)) return false
     return doesRuleMatchSender(rule, sender) && doesRuleMatchMessage(rule, message)
+  }
+
+  private fun doesRuleOtpGatePass(rule: Rule, message: String): Boolean {
+    if (!rule.requireOtp) return true
+    return OtpExtractor.extract(message).code != null
   }
 
   private fun doesRuleMatchSender(rule: Rule, sender: String): Boolean {
@@ -174,32 +170,80 @@ object SmsDispatcher {
       "any" -> true
       "contact" -> rule.contactPhoneNumbers.any { phoneNumbersMatch(it, sender) }
       else -> {
-        val pattern = rule.senderPattern.trim().lowercase(Locale.ROOT)
-        if (pattern.isEmpty()) return false
-        sender.trim().lowercase(Locale.ROOT).contains(pattern)
+        // sender_id mode: comma-separated entries, any match wins. Each
+        // entry is auto-detected as phone-shaped (digit-normalized) or
+        // brand/text (case-insensitive substring).
+        val entries = parseSenderList(rule.senderPattern)
+        if (entries.isEmpty()) return false
+        entries.any { doesSenderEntryMatch(it, sender) }
       }
     }
   }
 
+  private fun parseSenderList(input: String): List<String> =
+      input.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+
+  private fun doesSenderEntryMatch(entry: String, sender: String): Boolean {
+    val trimmed = entry.trim()
+    if (trimmed.isEmpty()) return false
+
+    val digits = normalizePhoneNumber(trimmed)
+    if (digits.length >= 7) {
+      return phoneNumbersMatch(trimmed, sender)
+    }
+
+    return sender.trim().lowercase(Locale.ROOT).contains(trimmed.lowercase(Locale.ROOT))
+  }
+
   private fun doesRuleMatchMessage(rule: Rule, message: String): Boolean {
     val normalizedMessage = message.trim().lowercase(Locale.ROOT)
-    if (normalizedMessage.isEmpty()) return false
+    if (normalizedMessage.isEmpty()) {
+      // Defensive: only forward an empty message when the rule has no
+      // content filters at all. Real SMS payloads are essentially never
+      // empty, so this branch mostly guards against carrier oddities.
+      return rule.messageAllowPatterns.isEmpty() && rule.messageBlockPatterns.isEmpty()
+    }
 
     if (rule.messageAllowPatterns.isNotEmpty()) {
       val hasAllowMatch =
           rule.messageAllowPatterns.any { pattern ->
-            normalizedMessage.contains(pattern.trim().lowercase(Locale.ROOT))
+            phraseMatches(pattern, normalizedMessage, rule.matchMode)
           }
       if (!hasAllowMatch) return false
     }
 
     val hasBlockedPattern =
         rule.messageBlockPatterns.any { pattern ->
-          normalizedMessage.contains(pattern.trim().lowercase(Locale.ROOT))
+          phraseMatches(pattern, normalizedMessage, rule.matchMode)
         }
     if (hasBlockedPattern) return false
 
     return true
+  }
+
+  /**
+   * Apply a single allow/block phrase using the rule's match mode.
+   * Invalid regex patterns are swallowed silently — we never want to crash
+   * the dispatcher because of a user-typed regex.
+   */
+  private fun phraseMatches(pattern: String, normalizedMessage: String, mode: String): Boolean {
+    val trimmed = pattern.trim()
+    if (trimmed.isEmpty()) return false
+    return try {
+      when (mode) {
+        "regex" -> Pattern.compile(trimmed, Pattern.CASE_INSENSITIVE).matcher(normalizedMessage).find()
+        "whole_word" ->
+            Pattern.compile(
+                    "\\b" + Pattern.quote(trimmed) + "\\b",
+                    Pattern.CASE_INSENSITIVE,
+                )
+                .matcher(normalizedMessage)
+                .find()
+        else -> normalizedMessage.contains(trimmed.lowercase(Locale.ROOT))
+      }
+    } catch (_: PatternSyntaxException) {
+      false
+    }
   }
 
   private fun phoneNumbersMatch(left: String, right: String): Boolean {
@@ -293,6 +337,10 @@ object SmsDispatcher {
       val contactPhones = jsonArrayToStringList(obj.optJSONArray("contactPhoneNumbers"))
       val allowPatterns = jsonArrayToStringList(obj.optJSONArray("messageAllowPatterns"))
       val blockPatterns = jsonArrayToStringList(obj.optJSONArray("messageBlockPatterns"))
+      // Phase A: requireOtp + matchMode are new — older saved rows are missing
+      // them. Default to legacy behavior (OTP required, plain `contains`).
+      val requireOtp = if (obj.has("requireOtp")) obj.optBoolean("requireOtp", true) else true
+      val matchMode = obj.optString("matchMode").ifEmpty { "contains" }
       out.add(
           Rule(
               id = id,
@@ -302,6 +350,8 @@ object SmsDispatcher {
               senderPattern = obj.optString("senderPattern"),
               contactDisplayName = obj.optString("contactDisplayName").ifEmpty { null },
               contactPhoneNumbers = contactPhones,
+              requireOtp = requireOtp,
+              matchMode = matchMode,
               messageAllowPatterns = allowPatterns,
               messageBlockPatterns = blockPatterns,
               destinationId = destinationId,
