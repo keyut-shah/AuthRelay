@@ -331,6 +331,8 @@ const styles = StyleSheet.create({
     borderColor: palette.border,
     backgroundColor: palette.panel,
     marginRight: 8,
+    height: 36,
+
   },
   chipActive: {
     backgroundColor: palette.accent,
