@@ -1018,9 +1018,9 @@ export function HomeScreen() {
 
   if (showWizard) {
     return (
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView style={styles.container} edges={['top', 'left', 'right']}>
         <KeyboardAvoidingView
-          style={styles.container}
+          style={styles.wizardRoot}
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         >
           <View style={styles.wizardHeader}>
@@ -1042,20 +1042,22 @@ export function HomeScreen() {
           </View>
 
           <ScrollView
-            style={styles.scrollArea}
+            style={styles.wizardScroll}
             contentContainerStyle={styles.wizardScrollContent}
             keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator
           >
-            {renderWizardStep()}
-          </ScrollView>
-
-          <View style={[styles.footer, { paddingBottom: 20 + insets.bottom }]}>
+            <View style={styles.wizardStepWrap}>{renderWizardStep()}</View>
+            <View style={[styles.footer, ]}>
             <Pressable style={styles.primaryButton} onPress={goNext}>
               <Text style={styles.primaryButtonText}>
                 {currentStep === stepLabels.length - 1 ? 'Complete Setup' : 'Continue'}
               </Text>
             </Pressable>
           </View>
+          </ScrollView>
+
+         
         </KeyboardAvoidingView>
       </SafeAreaView>
     );
@@ -1255,8 +1257,19 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingHorizontal: 20,
   },
+  wizardRoot: {
+    flex: 1,
+  },
+  wizardScroll: {
+    flex: 1,
+    paddingHorizontal: 20,
+  },
   wizardScrollContent: {
+    flexGrow: 1,
     paddingBottom: 24,
+  },
+  wizardStepWrap: {
+    flexGrow: 1,
   },
   homeScrollContent: {
     paddingTop: 0,
@@ -1559,6 +1572,7 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   wizardHeader: {
+    flexShrink: 0,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
@@ -1726,6 +1740,7 @@ const styles = StyleSheet.create({
     textAlign: 'right',
   },
   footer: {
+    flexShrink: 0,
     padding: 20,
     backgroundColor: palette.bg,
     borderTopWidth: 1,
